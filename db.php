@@ -3,30 +3,62 @@
  * functional MySQL database abstraction
  */
 
-namespace ThreadFinDB;
+namespace ThreadFin\DB;
 
+use Attribute;
 use Exception;
 use mysqli;
 use mysqli_result;
 use ThreadFin\MaybeA;
-use ThreadFin\MaybeStr;
-use const BitFire\WAF_ROOT;
-use function ThreadFin\func_name;
-use function ThreadFin\partial_right as BINDR;
+use ThreadFin\Core\MaybeStr;
 
-if (!defined("DUMP_FILE")) {
-    if (defined("WAF_ROOT")) {
-        define("DUMP_FILE", WAF_ROOT . "cache/dump.txt");
-    } else {
-        define("DUMP_FILE", sys_get_temp_dir() . "/dump.txt");
-    }
+use function ThreadFin\Util\func_name;
+use function ThreadFin\Core\partial_right as bind_r;
+use function ThreadFin\Core\partial as bind_l;
+use function ThreadFin\Log\debug;
+use function ThreadFin\Util\utc_time;
+
+const DB_FETCH_SUCCESS = 1;
+const DB_FETCH_NUM_ROWS = 2;
+const DB_FETCH_INSERT_ID = 4;
+const DB_DUPLICATE_IGNORE = 8;
+const DB_DUPLICATE_ERROR = 16;
+const DB_DUPLICATE_UPDATE = 32;
+const DB_MAX_BULK_INSERT = 64;
+
+
+/**
+ * The property is a primary key and will not update on duplicate
+ */
+#[Attribute(Attribute::TARGET_CLASS_CONSTANT|Attribute::TARGET_PROPERTY)]
+class NoUpdate { public function __construct() {} }
+/** 
+ * the attribute will not update on duplicate if the update would null it
+ */
+#[Attribute(Attribute::TARGET_CLASS_CONSTANT|Attribute::TARGET_PROPERTY)]
+class NotNull { public function __construct() {} }
+/**
+ * The property should only be updated if the value is not null and null in the DB
+ */
+#[Attribute(Attribute::TARGET_CLASS_CONSTANT|Attribute::TARGET_PROPERTY)]
+class IfNull { public function __construct() {} }
+
+
+// set the error log file if running in cli mode
+if (!defined("SQL_ERROR_FILE")) {
+    define("SQL_ERROR_FILE", "/tmp/php_sql_errors.log");
 }
 
+/**
+ * store mysql login credentials
+ * @package ThreadFin\DB
+ */
 class Credentials {
     public $username;
     public $password;
     public $prefix;
     public $db_name;
+    public $host;
 
     /**
      * create database credentials
@@ -46,9 +78,8 @@ class Credentials {
  * if data key begins with ! then the value is not quoted
  * EG: UPDATE $table set " . glue(" = ", $data, ", ") .  where_clause($where);
  */
-function glue(string $join, array $data, string $append_str = "") : string {
+function glue(string $join, array $data, string $append_str = ", ") : string {
     $result = "";
-    var_export($data);
     foreach ($data as $key => $value) {
         if ($result != '') { $result .= $append_str; }
         if ($key[0] === '!') { $key = substr($key, 1); $result .= "`{$key}` $join $value"; }
@@ -67,8 +98,10 @@ function quote($input) : string {
     if (is_numeric($input)) { return strval($input); }
     if (is_string($input)) { return "'".addslashes($input)."'"; }
     if (is_bool($input)) { return $input ? 1 : 0; }
-    if (is_array($input)) { return implode(',', array_map('\ThreadFinDB\quote', $input)); }
-    return $input;
+    if (is_array($input)) { return implode(',', array_map('\ThreadFin\DB\quote', $input)); }
+    $x = (string)$input;
+    debug("implicit quote cast to string: [%s]", $x);
+    return "'".addslashes($x)."'";
 }
 
 /**
@@ -77,13 +110,16 @@ function quote($input) : string {
  * @return string - the generated SQL where clause
  */
 function where_clause(array $data) : string { 
+    assert(count(array_filter(array_keys($data), 'is_string')) > 0, "where_clause requires an associative array");
+
     $result = " WHERE ";
     foreach ($data as $key => $value) {
+        if (strlen($result) > 7) { $result .= " AND "; }
         if ($key[0] == '!') {
             $t = substr($key, 1);
-            $result .= " `{$t}` = {$value} , ";
+            $result .= " `{$t}` = {$value} ";
         } else {
-            $result .= " `{$key}` = " . quote($value) . ",";
+            $result .= " `{$key}` = " . quote($value);
         }
     }
     $x = trim($result, ",");
@@ -92,27 +128,26 @@ function where_clause(array $data) : string {
 
 
 class DB {
-    protected $_db;
-    public $_errors;
-    public $logs = array();
+    public $errors = [];
+    public $logs = [];
     public $host;
     public $user;
     public $database;
+    public $last_stmt = "";
+
+    protected $_db;
     protected $_log_enabled = false;
     protected $_simulation = false;
     protected $_replay_enabled = false;
     protected $_err_filter_fn;
-    protected $_replay_log = [];
+    protected $_replay_file = "";
+    protected $_replay = [];
 
-    protected function __construct(?\mysqli $db) { $this->_db = $db; $this->_errors = array(); }
+    protected function __construct(?\mysqli $db) { $this->_db = $db; }
 
     public function __destruct() {
-        if ($this->_db) { $this->_db->close(); }
-        if (count ($this->_replay_log)) { 
-            file_put_contents("replay.log", "\n".implode(";\n", $this->_replay_log).";\n", FILE_APPEND);
-        }
+        if ($this->_db) { $this->close(); }
     }
-
 
     /**
      * @param null|mysqli $mysqli 
@@ -132,21 +167,30 @@ class DB {
     }
 
     /**
-     * @param bool $enable - enable or disable logging
+     * @param string $replay_file_name - the name of the replay log to record to
      * @return DB 
      */
-    public function enable_replay(bool $enable) : DB {
-        $this->_replay_enabled = $enable;
+    public function enable_replay(string $replay_file_name) : DB {
+        // attempt to create the replay file if it does not exist
+        if (!file_exists($replay_file_name)) {
+            touch($replay_file_name);
+            if (!file_exists($replay_file_name)) {
+                die("could not create replay file: $replay_file_name");
+            }
+        }
+        $this->_replay_file = $replay_file_name;
+        $this->_replay_enabled = true;
         return $this;
     }
 
 
     /**
-     * @param bool $enable - enable or disable simulation (no queries, just the log)
+     * @param bool $enable - enable or disable simulation (no queries, just the query log)
      * @return DB 
      */
     public function enable_simulation(bool $enable) : DB {
         $this->_simulation = $enable;
+        $this->enable_log(true);
         return $this;
     }
 
@@ -160,6 +204,15 @@ class DB {
         return DB::connect($cred->host, $cred->username, $cred->password, $cred->db_name);
     }
 
+    /**
+     * @todo: add support for retry.  busy network environments can cause connection failures
+     * 
+     * @param string $host 
+     * @param string $user 
+     * @param string $passwd 
+     * @param string $db_name 
+     * @return DB 
+     */
     public static function connect(string $host, string $user, string $passwd, string $db_name) : DB {
         $db = mysqli_init();
         mysqli_options($db, MYSQLI_OPT_CONNECT_TIMEOUT, 3);
@@ -174,115 +227,220 @@ class DB {
     }
 
     /**
-     * @param string $sql raw SQL to run.  be careful!
-     * @return bool 
+     * calls _qb internally to run a insert/update/delete statement.
+     * not for fetching data.  see @fetch instead
+     * 
+     * @param string $sql raw SQL to run.  be careful, this must be pre-escaped!
+     * @param int $mode, one of DB_FETCH_SUCCESS, DB_FETCH_NUM_ROWS, DB_FETCH_INSERT_ID
+     * @return DB_FETCH_SUCCESS -1 on error, 1 on success
+     *  DB_FETCH_NUM_ROWS -1 on error, 0 if no rows affected, >0 if rows affected
+     *  DB_FETCH_INSERT_ID -1 on error, >0 if insert id
      */
-    public function unsafe_raw(string $sql) : bool {
-        return $this->_qb($sql);
+    public function unsafe_raw(string $sql, int $mode = DB_FETCH_SUCCESS) : int {
+        assert(in_array($mode, [DB_FETCH_SUCCESS, DB_FETCH_NUM_ROWS, DB_FETCH_INSERT_ID], true), "invalid mode: $mode");
+
+        return intval($this->_qb($sql, $mode));
     }
 
     /**
-     * run SQL $sql return result as bool. errors stored tail($this->_errors)
+     * run SQL $sql return result as bool. errors stored tail($this->errors)
+     * @return -1 on error, 0 if no rows affected / no insert id, >0 if rows affected / insert id, 1 = success
      */
-    protected function _qb(string $sql) : bool {
+    protected function _qb(string $sql, int $return_type = DB_FETCH_SUCCESS) : int {
+        assert(!empty($this->_db), "database: {$this->database} is not connected");
+
+        $this->last_stmt = "$sql\n";
         $r = false;
+        $affected = -1;
+        $errno = 0;
         try {
-            if ($this->_log_enabled) { $this->logs[] = $sql; }
             if (!$this->_simulation) {
                 $r = mysqli_query($this->_db, $sql); 
             }
         }
         // silently swallow exceptions, will catch them in next line
-        catch (Exception $e) { $r = false; }
+        catch (Exception $ex) { $r = false; }
         if ($r === false) {
             $errno = mysqli_errno($this->_db);
             $err = "[$sql] errno($errno) " . mysqli_error($this->_db);
-            $this->_errors[] = $err;
+            $this->errors[] = $err;
+            return -1;
         }
-        return (bool)$r;
+        else {
+            if ($this->_replay_enabled || $this->_log_enabled || $return_type == DB_FETCH_NUM_ROWS) {
+                $affected = mysqli_affected_rows($this->_db);
+                if ($this->_log_enabled) {
+                    $msg = "# [$sql] errno($errno) affected rows($affected)";
+                    $this->logs[] = $msg;
+                }
+                if ($this->_replay_enabled && $affected > 0) {
+                    $this->_replay[] = $sql;
+                }
+            }
+            if ($return_type == DB_FETCH_NUM_ROWS) {
+                return intval($affected);
+            } else if ($return_type == DB_FETCH_INSERT_ID) {
+                $id = intval(mysqli_insert_id($this->_db));
+                return ($id == 0) ? -1 : $id;
+            }
+            return 1;
+        }
     }
 
     /**
-     * run SQL $sql return result as bool. errors stored tail($this->_errors)
+     * run SQL $sql return result as bool. errors stored tail($this->errors)
+     * convert $sql to SQL result
      */
     protected function _qr(string $sql, $mode = MYSQLI_ASSOC) : SQL {
-        $r = NULL;
+        assert(! empty($this->_db), "database: {$this->database} is not connected");
+        $r = false;
+        $errno = 0;
         try {
-            if ($this->_log_enabled) { $this->logs[] = $sql; }
-            if (!$this->_simulation) {
+            if (! $this->_simulation) {
                 $r = mysqli_query($this->_db, $sql); 
             }
         }
         // silently swallow exceptions, will catch them in next line
-        catch (Exception $e) { $r = NULL; }
-        if (!$r || !$r instanceof mysqli_result) {
+        catch (Exception $ex) { $r = false; }
+        if ($r == false || !$r instanceof mysqli_result) {
             $errno = mysqli_errno($this->_db);
             $err = "[$sql] errno($errno) " . mysqli_error($this->_db);
-            $this->_errors[] = $err;
+            $this->errors[] = $err;
             return SQL::from(NULL, $sql);
         }
+        else {
+            if ($this->_log_enabled) {
+                $e = mysqli_affected_rows($this->_db);
+                // $this->logs[] = $sql;
+                $msg = "# [$sql] errno($errno) selected rows($e)";
+                $this->logs[] = $msg;
+            }
+        }
+
         return SQL::from(mysqli_fetch_all($r, $mode), $sql);
     }
 
     /**
      * build sql replacing {name} with values from $data[name] = value
-     * auto quotes values,  use {!name} to not quote
+     * auto quote values,  use {!name} to not quote the value
+     * 
+     * $sql = $db->fetch("SELECT * FROM my_table WHERE id = {id} AND name = {name}", ['id' => 1, 'name' => 'bob']);
+     * 
+     * @see SQL
+     * @param string $sql - SELECT QUERY FROM your_table WHERE id = {id} 
+     * @param array|object $data - data to replace {params} with, key/values
      * @return SQL - SQL result abstraction
      */
-    public function fetch(string $sql, ?array $data = NULL, $mode = MYSQLI_ASSOC) : SQL {
-        if ($this->_db == NULL) { return SQL::from(NULL); }
+    public function fetch(string $sql, $data = NULL, $mode = MYSQLI_ASSOC) : SQL {
+        $new_sql = $this->fetch_to_statement($sql, $data, $mode);
 
+        // runtime errors
+        if ($this->_db == NULL) { return SQL::from(NULL, $sql); }
+        return $this->_qr($new_sql, $mode);
+    }
+
+    /**
+     * 
+     * @param string $sql 
+     * @param mixed $data 
+     * @param int $mode 
+     * @return string 
+     */
+    protected function fetch_to_statement(string $sql, $data = NULL, $mode = MYSQLI_ASSOC) : string {
+        // programming errors
+        //assert(!is_null($data) && !is_array($data) && !is_object($data), "$data must be null, array or object");
+        assert(is_null($data) || is_object($data) || (is_array($data) && count(array_filter(array_keys($data), 'is_string')) > 0), print_r($data, true) . " requires an associative array");
+
+        $type = (is_array($data)) ? 'array' : ((is_object($data)) ? 'object' : 'scalar');
         // replace {} with named values from $data, or $this->_x
-        $new_sql = preg_replace_callback("/{\w+}/", function ($x) use ($data) {
+        $new_sql = preg_replace_callback("/{!?\w+}/", function ($x) use ($data, $type) {
+            // strip off the template brackets
             $param = str_replace(array('{', '}'), '', $x[0]);
+            $quote_fn = '\ThreadFin\DB\quote';
+            // if the parameter should not be quoted, strip off the ! and use id for quote function
             if ($param[0] == "!") {
-                $key = substr($param, 1);
-                $result = $data[$key]??"NO_SUCH_KEY_$key";
-            } else {
-                $result = quote($data[$param]??"NO_SUCH_KEY_$param");
+                $param = substr($param, 1);
+                $quote_fn = '\ThreadFin\core\ident';
             }
+            // default to the scalar value 
+            $data_param = $param;
+            if ($type === "array") {
+                $data_param = $data[$param]??"NO_SUCH_KEY_$param";
+            } else if ($type === "object") {
+                $data_param = $data->$param;
+            }
+            $result = (string)$quote_fn($data_param);
             return $result;
         }, $sql);
 
-        return $this->_qr($new_sql, $mode);
+        return $new_sql;
     }
+
 
     /**
      * delete entries from $table where $data matches
      * @param string $table table name
      * @param array $where key value pairs of column names and values
-     * @return bool 
+     * @return int -1 on error, 0 if no rows were deleted, > 0 number rows that were deleted
      */
-    public function delete(string $table, array $where) : bool {
+    public function delete(string $table, array $where) : int {
         $sql = "DELETE FROM $table " . where_clause($where);
-        $success = $this->_qb($sql);
-        if ($success) {
-            if ($this->_replay_enabled || $this->_log_enabled) {
-                $e = mysqli_affected_rows($this->_db);
+        return intval($this->_qb($sql, DB_FETCH_NUM_ROWS));
+    }
+
+    /**
+     * helper function to create an insert statement
+     * @param string $table 
+     * @param array $data 
+     * @param int $on_duplicate 
+     * @param null|array $no_update 
+     * @param null|array $if_null 
+     * @return string 
+     */
+    protected function insert_stmt(string $table, array $data, int $on_duplicate = DB_DUPLICATE_IGNORE, ?array $no_update = null, ?array $if_null = null) : string {
+        
+        $ignore = "";
+        // ignore duplicates
+        if ($on_duplicate === DB_DUPLICATE_IGNORE) {
+            $ignore = "IGNORE";
+        }
+
+        $sql = "INSERT $ignore INTO `$table` (`" . join("`,`", array_keys($data)) . 
+        "`) VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))).")";
+
+        // update on duplicate, exclude any PKS
+        if ($on_duplicate === DB_DUPLICATE_UPDATE) {
+            $update_data = array_diff_key($data, $no_update);
+            // UGLY AF
+            $suffix = "";
+            foreach($update_data as $key => $value) {
+                $q_value = quote($value);
+                if (isset($if_null[$key])) {
+                    $suffix .= "`$key` = IF(`$key` = '' OR `$key` IS NULL, $q_value, `$key`), ";
+                } else {
+                    $suffix .= "`$key` = $q_value, ";
+                }
             }
-            if ($this->_replay_enabled && $e > 0) {
-                $this->_replay_log[] = $sql;
-            }
-            if ($this->_log_enabled) {
-                $this->logs[] = " --> effected rows: $e";
+            if (!empty($suffix)) {
+                $sql .= " ON DUPLICATE KEY UPDATE " . substr($suffix, 0, -2);
             }
         }
-        return $success;
+
+        return $sql;
     }
 
     /**
      * insert $data into $table 
      * @param string $table 
      * @param array $kvp 
-     * @return bool 
+     * @param int $on_duplicate - DB_DUPLICATE_IGNORE, DB_DUPLICATE_UPDATE. 
+     *   IMPORTANT! for update be sure auto incrementing PK is not in $data
+     * @return int 
      */
-    public function insert(string $table, array $kvp) : bool {
-        $sql = "INSERT INTO $table (" . join(",", array_keys($kvp)) . 
-        ") VALUES (" . join(",", array_map('\ThreadFinDB\quote', array_values($kvp))).")";
+    public function insert(string $table, array $kvp, int $on_duplicate = DB_DUPLICATE_IGNORE) : int {
+        $sql = $this->insert_stmt($table, $kvp, $on_duplicate);
 
-        $success = $this->_qb($sql);
-        if ($success && $this->_replay_enabled) { $this->_replay_log[] = $sql; }
-        return $success;
+        return intval($this->_qb($sql));
     }
 
     /**
@@ -292,41 +450,57 @@ class DB {
      * @param ?array $keys list of allowed key names from the passed $data
      * @return callable(array $data) insert $data into $table 
      */
-    public function insert_fn(string $table, ?array $keys = null) : callable { 
+    public function insert_fn(string $table, ?array $keys = null, bool $ignore_duplicate = true, int $return_type = DB_FETCH_SUCCESS) : callable { 
         $t = $this;
-        return function(array $data) use ($table, $t, $keys) : bool {
+        return function(array $data) use ($table, &$t, $keys, $ignore_duplicate) : int {
+            // filter out unwanted key/values
             if (!empty($keys)) {
-                $data = array_filter($data, BINDR('in_array', $keys), ARRAY_FILTER_USE_KEY);
+                $data = array_filter($data, bind_r('in_array', $keys), ARRAY_FILTER_USE_KEY);
             }
-            $sql = "INSERT INTO $table (" . join(",", array_keys($data)) . 
-                ") VALUES (" . join(",", array_map('\ThreadFinDB\quote', array_values($data))) . ")";
+            $ignore = ($ignore_duplicate) ? "IGNORE" : "";
+            $sql = "INSERT $ignore INTO $table (" . join(",", array_keys($data)) . 
+                ") VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))) . ")";
 
-            $success = $t->_qb($sql);
-            if ($success && $this->_replay_enabled) { $t->_replay_log[] = $sql; }
-            return $success;
+            return $t->_qb($sql);
         };
     }
 
     /**
+     * TODO: test if we can just pass $this->qb to the closure, instead of $this
      * return a function that will insert key value pairs into $table.
      * does not support {} replacement
      * @param string $table the table name
      * @param array $columns column names in (col1, col2) or (col->data) format
-     * @return callable(?array $data) that takes KVP ordered in $columns order. 
-     *         pass null as KVP data to run the bulk query
+     * @return callable(?array $data) that takes KVP where array_values($columns)
+     *         value are indexes into $data. 
+     *         pass null as KVP data to run the bulk query and return 1 - success
+     *         0 - failure;
+     * 
      */
-    public function bulk_fn(string $table, array $columns) : callable { 
+    public function bulk_fn(string $table, array $columns, bool $ignore_duplicate = true) : callable { 
         $t = $this;
-        $sql = "INSERT INTO $table (" . join(",", array_keys($columns)) . ") VALUES ";
-        return function(?array $data = null) use (&$sql) : bool {
+        $ignore = ($ignore_duplicate) ? "IGNORE" : "";
+        $num_columns = count($columns);
+        return function(?array $data = null) use (&$t, $table, $columns, $ignore, $num_columns) : int {
+            static $ctr = 0;
+            static $sql = "";
             if ($data !== null) {
-                $sql .= join(",", array_map('\ThreadFinDB\quote', array_values($data))) . ")";
-                return false;
+                $ctr++;
+                $sql .= "(";
+                $column_count = 0;
+                foreach ($columns as $column_name => $key_name) {
+                    $sql .= quote($data[$key_name]);
+                    $sql .= (++$column_count < $num_columns) ? "," : "),\n";
+                }
+                return $ctr;
             }
-
-            $success = $this->_qb($sql);
-            if ($success && $this->_replay_enabled) { $this->_replay_log[] = $sql; }
-            return $success;
+            if ($ctr > 0 || $ctr > DB_MAX_BULK_INSERT) {
+                $stmt = "INSERT $ignore INTO $table (" . join(",", array_keys($columns)) . ") VALUES " . substr($sql, 0, -2);
+                $ctr = 0;
+                $sql = "";
+                return $t->_qb($stmt);
+            }
+            return 0;
         };
     }
 
@@ -335,8 +509,13 @@ class DB {
     /**
      * update $table and set $data where $where
      */
-    public function update(string $table, array $data, array $where) : bool {
-        $sql = "UPDATE $table set " . glue(" = ", $data, ", ") .  where_clause($where);
+    public function update(string $table, array $data, array $where) : int {
+        // unset all where keys in data. this makes no sense when where is a PK
+        //do_for_all_key($where, function ($x) use (&$data) { unset($data[$x]); });
+        array_walk($where, function ($value, $key) use (&$data) { unset($data[$key]); });
+
+        // glue does the escaping for us here...
+        $sql = "UPDATE `$table` set " . glue(" = ", $data) .  where_clause($where);
         return $this->_qb($sql);
     }
 
@@ -345,26 +524,85 @@ class DB {
      * same names as the table
      * @return bool true if the SQL write is successful
      */
-    public function store(string $table, Object $data) : bool {
-        if (!$this->_db) { return false; }
+    public function store(string $table, Object $data, int $on_duplicate = DB_DUPLICATE_IGNORE) : int {
+        assert(is_resource($this->_db), "database not connected");
+
+        // TODO: this should be it's own object to array function with tests
         $r = new \ReflectionClass($data);
         $props = $r->getProperties(\ReflectionProperty::IS_PUBLIC);
-        $name_list = array_reduce($props, function($carry, $item) {
-            return $carry . ", " . $item->getName(); 
-        });
-        $value_list = array_reduce($props, function($carry, $item) use ($data) {
-            $name = $item->getName(); return $carry . ", " . $data->$name;
-        });
-        $sql = "INSERT INTO $table (" . trim($name_list, ", ") .
-            ") VALUES (" . trim($value_list, ", ") . ")";
-        return $this->_qb($sql);
+        $no_updates = [];
+        $if_null = [];
+        // turn the object into an array, update PKS for update list
+        $kvp = array_reduce($props, function($kvp, $item) use ($data, $on_duplicate, &$no_updates, &$if_null) {
+            $name = $item->name;
+            $attrs = $item->getAttributes();
+
+            foreach ($attrs as $attr) {
+                $attribute = $attr->getName();
+                switch($attribute) {
+                    case "ThreadFinDB\NoUpdate":
+                        $no_updates[$name] = true;
+                        break;
+                    case "ThreadFinDB\NotNull":
+                        if (!isset($data->$name) || empty($data->$name)) {
+                            return $kvp;
+                        }
+                        break;
+                    case "ThreadFinDB\IfNull":
+                        $if_null[$name] = true;
+                }
+            }
+
+            if (isset($data->$name)) {
+                $kvp[$name] = $data->$name;
+            }
+            return $kvp;
+        }, []);
+
+        $sql = $this->insert_stmt($table, $kvp, $on_duplicate, $no_updates, $if_null);
+        return $this->_qb($sql, DB_FETCH_INSERT_ID);
     }
 
+    /**
+     * close the database handle and write the transaction log if we have one
+     * @return void 
+     */
     public function close() : void {
-        if ($this->_db) { mysqli_close($this->_db); $this->_db = NULL; }
-        if (count($this->_errors) > 0) {
-            $errors = array_filter($this->_errors, function($x) { return stripos($x, "Duplicate") != false; });
-            file_put_contents("/tmp/php_db_errors.txt", print_r($errors, true), FILE_APPEND);
+        if (!empty($this->_db)) { mysqli_close($this->_db); $this->_db = NULL; }
+        if (SQL_ERROR_FILE) {
+            if (count($this->errors) > 0) {
+                $errors = array_filter($this->errors, function($x) { return stripos($x, "Duplicate") != false; });
+                if (count($this->errors) > 0) {
+                    file_put_contents(SQL_ERROR_FILE, print_r($errors, true), FILE_APPEND);
+                }
+            }
+        }
+        if (!empty($this->_replay_file)) {
+            echo "writing replay log to: ". $this->_replay_file . "\n";
+            if (stristr($this->_replay_file, ".php")) {
+                die("refusing to write replay log to: ". $this->_replay_file);
+            }
+        }
+        if (count($this->_replay) >= 1) { 
+            $attempts = 10;
+            while ($attempts-- > 0) {
+                echo "writing replay log to: ". $this->_replay_file . "\n";
+                $fp = fopen($this->_replay_file, "a+");
+                if (flock($fp, LOCK_EX)) {  // acquire an exclusive lock
+                    fwrite($fp, "\n".implode(";\n", $this->_replay).";\n");
+                    fflush($fp);            // flush output before releasing the lock
+                    flock($fp, LOCK_UN);    // release the lock
+                    fclose($fp);
+                    $attempts = -1;
+                } else {
+                    fclose($fp);
+                    sleep(1);
+                    echo "!!!! PANIC !!!! Couldn't get the lock for replay file!\n";
+                }
+            }
+            //file_put_contents($this->_replay_file, "\n".implode(";\n", $this->logs).";\n", FILE_APPEND);
+        } else {
+            echo "empty replay log\n";
         }
     }
 }
@@ -422,7 +660,7 @@ class SQL {
     /**
      * @return MaybeStr of column $name at current row index
      */
-    public function col(string $name) : MaybeSTR {
+    public function col(string $name) : MaybeStr {
         if (isset($this->_x[$this->_idx])) {
             return MaybeStr::of($this->_x[$this->_idx][$name]??NULL);
         } 
@@ -495,14 +733,15 @@ class SQL {
     /**
      * reduce $fn($carry, $item) on each row in entire result (works on raw result, no set necessary)
      * $fn may return any type, but should be a string in 99% cases
+     * @return mixed return type of $fn, false if rows (_x) is empty
      */
-    public function reduce(callable $fn, $initial = "") : array {
+    public function reduce(callable $fn, $initial = "") : mixed {
         if (is_array($this->_x) && !empty($this->_x)) {
             return array_reduce($this->_x, $fn, $initial);
         } else {
             $this->_errors[] = "wont call " . func_name($fn) . " on data : " . var_export($this->_data, true);
         }
-        return [];
+        return false;
     }
     // run an a function that has external effect on current data
     public function effect(callable $fn) : SQL { 
@@ -539,3 +778,145 @@ class SQL {
     }
 }
 
+
+/**
+ * database backup checkpoint offset
+ * @package ThreadFinDB
+ */
+class Offset {
+    public $table;
+    public $limit_sz = 0;
+    public $offset = 0;
+    const TABLE_COMPLETE = -1;
+
+    public function __construct(string $table, int $limit_sz = 300) {
+        $this->limit_sz = $limit_sz;
+        $this->table = $table;
+    }
+
+    /**
+     * update a table saved offset
+     * @param string $table 
+     * @param int $offset 
+     * @param int $limit 
+     * @return void 
+     */
+    public function set_check_point(int $offset) {
+        $this->offset = $offset;
+    }
+
+    /**
+     * @param string $table 
+     * @return bool true if the table is completely dumped, false if not or incomplete
+     */
+    public function is_table_complete() : bool {
+        return $this->offset == Offset::TABLE_COMPLETE;
+    }
+}
+
+/**
+ * function suitable for database dumping to gz compressed output file
+ * this is equal to calling stream_output_fn($data, $stream, "gzwrite")
+ * @param string $data 
+ * @param mixed $stream 
+ * @return int -1 on error, else total byte length written to stream across all writes
+ */
+function gz_output_fn(?string $data, $stream) : int {
+    return stream_output_fn($data, $stream, "gzwrite");
+}
+
+/**
+ * function suitable for database dumping to gz compressed output file
+ * @param string $data 
+ * @param mixed $stream 
+ * @return int -1 on error, else total byte length written to stream across all writes
+ */
+function stream_output_fn(?string $data, $stream, $fn = "fwrite") : int {
+    assert(is_resource($stream), "stream must be a resource");
+    static $total_bytes = 0;
+
+    if ($data && strlen($data) > 0) {
+        $bytes = $fn($stream, $data);
+        if (!$bytes) {
+            return -1;
+        }
+        $total_bytes += $bytes;
+    }
+    return $total_bytes;
+}
+
+
+/**
+ * dump a single SQL table 100 rows at a time
+ * @param DB $db 
+ * @param string $db_dump_file 
+ * @param mixed $row 
+ * @return int number of uncompressed bytes written
+ */
+function dump_table(DB $db, callable $write_fn, array $row) : ?Offset {
+    $idx = 0;
+    $limit = 300;
+    $db_name = $db->database;
+    $table = $row["Tables_in_$db_name"];
+    $offset = new Offset($table);
+
+    // find number of rows
+    $num_rows = intval($db->fetch("SELECT count(*) as count FROM $table")->col("count")());
+    // the create statement
+    $create = $db->fetch("SHOW CREATE TABLE $table");
+    // table header line
+    $write_fn("# Export of $table\n# $num_rows rows in $table\n");
+    // drop table if it exists
+    $write_fn("DROP TABLE IF EXISTS `$table`;\n");
+    // add create statement
+    $write_fn($create->col("Create Table")() . ";\n\n");
+
+    // insert $limit rows at a time
+    while($idx < $num_rows) {
+        $limit = min($limit, $num_rows - $idx);
+        $rows = $db->fetch("SELECT * FROM $table LIMIT $limit OFFSET $idx", NULL, MYSQLI_NUM);
+        // create the output string
+        $result = $rows->reduce(function(string $carry, array $row) {
+            return $carry . "(" . implode(",", array_map('\ThreadFin\DB\quote', $row)) . "),\n";
+        }, "INSERT IGNORE INTO $table VALUES");
+        // write to the output stream
+        $bytes_written = $write_fn(substr($result, 0, -2) . ";\n\n");
+        if ($bytes_written < 0 || $bytes_written > 1048576*20) {
+            return $offset;
+        }
+
+        // increment the offset by the limit
+        $idx += $limit;
+        $offset->set_check_point($idx);
+
+        // let the database rest a second
+        usleep(100000);
+    }
+    $offset->set_check_point(Offset::TABLE_COMPLETE);
+
+    return $offset;
+}
+
+/**
+ * dump all database tables to the function $write_fn
+ * @param Credentials $cred Access credentials to the database
+ * @param string $db_name the name of the database (eg, wordpress)
+ * @param callable $write_fn a function that takes a string and 
+ *      writes it to the output stream (fwrite, gzwrite, etc)
+ * @return array of Offset objects. one for each table in $db_name
+ */
+function dump_database(Credentials $cred, string $db_name, callable $write_fn, int $max_bytes = 1024*1024*50) : array {
+    $header = "# Database export of ($db_name) began at UTC: " 
+            . date(DATE_RFC3339) . "\n# UTC tv: " . utc_time() . "\n\n";
+    $init_sql = "SET NAMES 'utf8'\n";
+
+    $db = DB::cred_connect($cred);
+    $db->unsafe_raw($init_sql);
+    $tables = $db->fetch("SHOW TABLES");
+    $write_fn($header . $init_sql);
+
+    $t = bind_l('\ThreadFin\DB\dump_table', $db, $write_fn);
+    $tables->map($t);
+    $data = $tables->data();
+    return (!$data || empty($data) || !is_array($data)) ? [] : $data;
+}

@@ -48,11 +48,11 @@ function find(array $items, callable $f) {
     return null;
 }
 
-function if_else($truth, callable $is, callable $isnot) {
+function if_else($truth, callable $is_fn, callable $is_not_fn) {
     if ($truth) {
-        return $is();
+        return $is_fn();
     } else {
-        return $isnot();
+        return $is_not_fn();
     }
 }
 
@@ -80,20 +80,20 @@ function cuckoo_key(string $key): array {
  */
 function cuckoo_find_free_mem($ctx, $size, $priority = 0 | CUCKOO_LOW): array
 {
-    // can't attemnt to store values beyond the max size
+    // can't attempt to store values beyond the max size
     if ($size > CUCKOO_MAX_SIZE) {
         return [null, null];
     }
 
-    // calculate a reasonable blocksize
+    // calculate a reasonable block_size
     $block_size = intval(ceil($size / $ctx['chunk_size']) * $ctx['chunk_size']);
 
     // lock memory
     if (cuckoo_lock_for_write($ctx, $block_size)) {
-        // find a location to allocate at the end of the stack, if full, defragment and return end of stack
+        // find a location to allocate at the end of the stack, if full, defrag and return end of stack
         $ptr = ($ctx['free'] + $block_size >= $ctx['mem_end']) ? cuckoo_mem_defrag($ctx) : $ctx['free'];
 
-        // if we have a location (not full and defrag successful), updatee pointer location
+        // if we have a location (not full and defrag successful), update pointer location
         if ($ptr !== null) {
             $mem = unpack("nitems/nsize/Lfree", shmop_read($ctx['rid'], ($ctx['mem_end']), 8));
             shmop_write($ctx['rid'], pack("nnL", $ctx['slots'], $ctx['chunk_size'], $ptr + $block_size), $ctx['mem_end']);
@@ -144,7 +144,7 @@ function cuckoo_mem_defrag($ctx): void
 {
     $final = null;
 
-    reduce(ceil($ctx['items'] / 64), function($x) use ($ctx, &$final) {
+    reduce(intval(ceil($ctx['items'] / 64)), function($x) use ($ctx, &$final) {
         $read_len = (CUCKOO_EXP_SIZE_BYTES * 64);
         $start_byte = $x * $read_len;
 
@@ -384,6 +384,8 @@ function cuckoo_connect(int $items = 4096, int $chunk_size = 1024, int $mem = 11
     $mem_end = $entry_end + $mem;
 
     $rid = cuckoo_open_mem($mem_end + 16, $key);
+
+    // TODO: make this a readonly class
     $ctx = Array(
         'rid' => $rid, 
         'txid' => mt_rand(1, 2147483647),
@@ -394,9 +396,8 @@ function cuckoo_connect(int $items = 4096, int $chunk_size = 1024, int $mem = 11
         "chunk_size" => $chunk_size);
 
 
-    // initizlized memory writes num items and chunk size to last initialized byte
+    // initialized memory writes num items and chunk size to last initialized byte
     $mem = unpack("nitems/nsize/Lfree/Llockid/Llockexp", shmop_read($ctx['rid'], ($ctx['mem_end']), 16));
-    print_r($mem);
 
     // memory needs initialization...
     if ($force_init || $mem['items'] !== $items || $mem['size'] !== $chunk_size) {
