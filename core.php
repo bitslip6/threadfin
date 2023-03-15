@@ -89,12 +89,14 @@ function writer(FileChange $file) : ?TF_Error {
         }
     }
 
-    return null;
+    return NULL;
 }
 
 namespace ThreadFin\Log;
 
-define("ThreadFin\Log\TRACE_LEVEL", 1);
+if (!defined("ThreadFin\Log\TRACE_LEVEL")) {
+    define("ThreadFin\Log\TRACE_LEVEL", 1);
+}
 const RETURN_LOG = -99;
 const CLEAN_LOG = -101;
 const ACTION_RETURN = -9999999;
@@ -207,20 +209,23 @@ function debug_log_file(string $path) : void {
 
 namespace ThreadFin\Core;
 
+use InvalidArgumentException;
 use OutOfBoundsException;
-use ThreadFin\Cache\Cache;
 use ThreadFin\File\FileChange;
 
 use const ThreadFin\Log\RETURN_LOG;
 
+use function ThreadFin\Assertions\fn_arg_x_has_type;
 use function ThreadFin\Assertions\fn_arg_x_is_type;
 use function ThreadFin\Assertions\fn_returns_type;
+use function ThreadFin\Assertions\fn_takes_x_args;
 use function ThreadFin\Assertions\fn_takes_x_or_more_args;
 use function ThreadFin\Assertions\last_assert_err;
 use function ThreadFin\Log\debug;
 use function ThreadFin\Log\trace;
 use function ThreadFin\Log\trace2;
 use function ThreadFin\Log\trace3;
+use function ThreadFin\Util\array_clone;
 use function ThreadFin\Util\func_name;
 
 /**
@@ -230,23 +235,86 @@ use function ThreadFin\Util\func_name;
 class Entity {
 } 
 
+interface Hash_Code {
+    public function hash_code() : string;
+}
+
 
 /**
- * a <generic> list of errors
- * @package 
+ * a <generic> list. this is the base class for all typed lists 
+ * @package ThreadFin\Core
  */
-abstract class Typed_List implements \ArrayAccess, \Iterator, \Countable {
+abstract class Typed_List implements \ArrayAccess, \Iterator, \Countable, \SeekableIterator {
 
-    private int $_position = 0;
-    public array $_list = [];
+    protected string $_type = "mixed";
+    protected $_position = 0;
+    protected array $_list;
 
-    // return the number of items in the list
+    private bool $_is_associated = false;
+    private $_keys;
+
+    
+    public function __construct(array $list = []) {
+        $this->_list = $list;
+        $this->_type = $this->get_type();
+    }
+
+    /**
+     * Example: echo $list[$index]
+     * @param mixed $index index may be numeric or hash key
+     * @return $this->_type cast this to your subclass type
+     */
+    #[\ReturnTypeWillChange]
+    public abstract function offsetGet($index);
+
+    /**
+     * Example: foreach ($list as $key => $value)
+     * @return mixed cast this to your subclass type at the current iterator index
+     */
+    #[\ReturnTypeWillChange]
+    public abstract function current();
+
+
+    /**
+     * @return string the name of the type list supports or mixed
+     */
+    public abstract function get_type() : string;
+
+
+    /**
+     * return a new instance of the subclass with the given list
+     * @param array $list 
+     * @return static 
+     */
+    public static function of(array $list) : static {
+        return new static($list);
+    }
+
+    /**
+     * clone the current list into a new object
+     * @return static new instance of subclass
+     */
+    #[\ReturnTypeWillChange]
+    public function clone() {
+        $new = new static();
+        $new->_list = array_clone($this->_list);
+        return $new;
+    }
+
+    /**
+     * Example count($list);
+     * @return int<0, \max> - the number of elements in the list
+     */
     public function count(): int {
         return count($this->_list);
     }
 
-    // SeekableIterator impl. seek a specific position in the list
-    public function seek($position) {
+    /**
+     * SeekableIterator implementation
+     * @param mixed $position - seek to this position in the list
+     * @throws OutOfBoundsException - if the element does not exist
+     */
+    public function seek($position) : void {
         if (!isset($this->_list[$position])) {
             throw new OutOfBoundsException("invalid seek position ($position)");
         }
@@ -254,61 +322,161 @@ abstract class Typed_List implements \ArrayAccess, \Iterator, \Countable {
         $this->_position = $position;
     }
 
-    // SeekableIterator impl. reset the list position to the first element
+    /**
+     * SeekableIterator implementation. seek internal pointer to the first element
+     * @param mixed $position - seek to this position in the list
+     */
     public function rewind() : void {
-        $this->_position = 0;
+        if ($this->_is_associated) {
+            $this->_keys = array_keys($this->_list);
+            $this->_position = array_shift($this->_keys);
+        } else {
+            $this->_position = 0;
+        }
     }
 
-    // SeekableIterator impl. return the current index
+    /**
+     * SeekableIterator implementation. equivalent of calling current()
+     * @return mixed - the pointer to the current element
+     */
     public function key() : mixed {
         return $this->_position;
     }
 
-    // SeekableIterator impl. move to the next element
+    /**
+     * SeekableIterator implementation. equivalent of calling next()
+     */
     public function next(): void {
-        ++$this->_position;
+        if ($this->_is_associated) {
+            $this->_position = array_shift($this->_keys);
+        } else {
+            ++$this->_position;
+        }
     }
 
-    // SeekableIterator impl. check if the current position is valid
+    /**
+     * SeekableIterator implementation. check if the current position is valid
+     */
     public function valid() : bool {
-        return isset($this->_list[$this->_position]);
+        if (isset($this->_list[$this->_position])) {
+            if ($this->_type != "mixed") {
+                return $this->_list[$this->_position] instanceof $this->_type;
+            }
+            return true;
+        }
+        return false;
     }
 
-    // ArrayAccess impl. set the value at a specific index
+    /**
+     * Example: $list[1] = "data";  $list[] = "data2";
+     * ArrayAccess implementation. set the value at a specific index
+     * @throws 
+     */
     public function offsetSet($index, $value) : void {
-        $this->_list[$index] = $value;
+        // type checking
+        if ($this->_type != "mixed") {
+            if (! $value instanceof $this->_type) {
+                $msg = get_class($this) . " only accepts objects of type \"" . $this->_type . "\", \"" . gettype($value) . "\" passed";
+                throw new InvalidArgumentException($msg, 1);
+            }
+        }
+        if (empty($index)) {
+            $this->_list[] = $value;
+        } else {
+            $this->_is_associated = true;
+            if ($index instanceof Hash_Code) {
+                $this->_list[$index->hash_code()] = $value;
+            } else {
+                $this->_list[$index] = $value;
+            }
+        }
     }
 
-    // ArrayAccess impl. remove(unset) the value at a specific index
+    /**
+     * unset($list[$value]);
+     * ArrayAccess implementation. unset the value at a specific index
+     */
     public function offsetUnset($index) : void {
         unset($this->_list[$index]);
     }
 
-    // ArrayAccess impl. check if the value at a specific index exists
+    /**
+     * ArrayAccess implementation. check if the value at a specific index exist
+     */
     public function offsetExists($index) : bool {
         return isset($this->_list[$index]);
     }
 
-    // Sort the list by key values
-    public function ksort(int $flags = SORT_REGULAR): bool {
-        return ksort($this->_list, $flags);
+    /**
+     * example $data = array_map($fn, $list->raw());
+     * @return array - the internal array structure
+     */
+    public function &raw() : array {
+        return $this->_list;
     }
 
-    public function getIterator(): \Traversable {
+
+    /**
+     * sort the list
+     * @return static - the current instance sorted
+     */
+    public function ksort(int $flags = SORT_REGULAR): static {
+        ksort($this->_list, $flags);
         return $this;
     }
 
-    // helper method
+    /**
+     * @return bool - true if the list is empty
+     */
     public function empty() : bool {
         return empty($this->_list);
     }
+   
 
-    //public abstract function add($item) : void;
-    public abstract function offsetGet($index) : mixed;
 
-    // SeekableIterator impl. return the element at $this->_position.
-    // override the return type!
-    public abstract function current() : mixed;
+    /**
+     * helper method to be used by offsetGet() and current(), does bounds and key type checking
+     * @param mixed $key 
+     * @throws OutOfBoundsException - if the key is out of bounds
+     */
+    protected function protected_get($key) {
+        if ($this->_is_associated) {
+            if (isset($this->_list[$key])) {
+                return $this->_list[$key];
+            }
+        }
+        else {
+            if ($key <= count($this->_list)) {
+                return $this->_list[$key];
+            }
+        }
+
+        throw new OutOfBoundsException("invalid key [$key]");
+    }
+
+
+   /**
+     * filter the list using the given function 
+     * @param callable $fn 
+     * @return static
+     */
+    public function filter(callable $fn, bool $clone = false) {
+        assert(fn_takes_x_args($fn, 1), last_assert_err() . " in " . get_class($this) . "->map()"); 
+        assert(fn_arg_x_is_type($fn, 0, $this->_type), last_assert_err() . " in " . get_class($this) . "->map()");
+        if ($clone) {
+            return new static(array_filter(array_clone($this->_list), $fn));
+        }
+        $this->_list = array_filter($this->_list, $fn);
+        return $this;
+    }
+
+    /**
+     * json encoded version of the list
+     * @return string json encoded version of first 5 elements
+     */
+    public function __toString() : string {
+        return json_encode(array_slice($this->_list, 0, 5));
+    }
 }
 
 
@@ -329,6 +497,8 @@ class TF_Error {
  * @package 
  */
 class TF_ErrorList extends Typed_List {
+
+    public function get_type() : string { return "\ThreadFin\Core\TF_Error"; }
 
     // used for index access
     public function offsetGet($index): ?TF_Error {
@@ -661,7 +831,7 @@ class Effect {
     // return the effect headers
     public function read_headers() : array { return $this->headers??[]; }
     // return the effect cookie (only 1 cookie supported)
-    public function read_cookies() : array { return $this->cookie??[]; }
+    public function read_cookies() : array { return $this->cookies??[]; }
     // return the effect cache updates
     public function read_cache() : array { return $this->cache??[]; }
     // return the effect response code
@@ -749,7 +919,7 @@ function effect_run(Effect $effect) : TF_ErrorList {
     // send all cookies
     $cookies = $effect->read_cookies();
     array_walk($cookies, fn(Cookie $x) => 
-        $errors->add(TF_cookie($x->key, $x->value, $x->expires, $x->path, $x->domain, $x->secure, $x->http_only))
+        $errors->add(TF_cookie($x->name, $x->value, $x->expires, $x->path, $x->domain, $x->secure, $x->http_only))
     );
 
     // send all headers, map value,key to key,value
@@ -759,6 +929,8 @@ function effect_run(Effect $effect) : TF_ErrorList {
     );
 
     // update all cache entries
+    /*
+    TODO: add caching...
     $cache = $effect->read_cache();
     array_walk($cache, function(CacheItem $item) use (&$errors){
         $updated = Cache::update_data(
@@ -767,6 +939,7 @@ function effect_run(Effect $effect) : TF_ErrorList {
             $errors->add(new TF_Error("unable to update cache entry: $item->key", __FILE__, __LINE__));
         }
     });
+    */
 
     // write the files to disk
     $files = $effect->read_files();
@@ -786,7 +959,7 @@ function effect_run(Effect $effect) : TF_ErrorList {
         $api = $effect->read_api();
         if (!empty($api)) {
             TF_header("content-type", "application/json");
-            echo json_encode($effect->api, JSON_PRETTY_PRINT);
+            echo json_encode($effect->read_api(), JSON_PRETTY_PRINT);
         }
         // standard output
         else {
@@ -1165,8 +1338,7 @@ class MaybeStr implements Maybe {
     // call the function with the value if the value is not empty 
     // the maybe value is not changed
     public function effect(callable $fn): MaybeStr {
-        assert(fn_returns_type($fn, 'string'), "map " . last_assert_err());
-        assert(fn_takes_x_or_more_args($fn, 1), "map " . last_assert_err());
+        assert(fn_takes_x_or_more_args($fn, 1), "effect " . last_assert_err());
 
         if (!empty($this->_value)) {
             $fn($this->_value);
@@ -1188,7 +1360,7 @@ class MaybeStr implements Maybe {
     // call function $fn if the value is empty.  $fn should not require any arguments
     // if $fn returns a value, then set the maybe value to that value
     public function if_not(callable $fn): MaybeStr {
-        assert(fn_returns_type($fn, 'string'), "keep_if " . last_assert_err());
+        assert(fn_returns_type($fn, 'bool'), "keep_if " . last_assert_err());
         assert(fn_takes_x_or_more_args($fn, 1), "keep_if " . last_assert_err());
 
         if (empty($this->_value)) {
@@ -1213,6 +1385,87 @@ class MaybeStr implements Maybe {
     // return the length of the string
     public function size(): int {
         return (!empty($this->_value)) ? strlen($this->_value) : 0;
+    }
+}
+
+class MaybeA implements Maybe {
+    protected ?array $_value;
+
+    protected function __construct($value) {
+        $this->_value = $value;
+    }
+
+    // create a new MaybeString from a value
+    public static function of(?array $x = null): MaybeA {
+        return new MaybeA($x);
+    }
+
+    // return the value of the maybe
+    public function value(): ?array {
+        return $this->_value;
+    }
+
+    // applying the function to the value if the value is not empty
+    public function map(callable $fn): MaybeA {
+        assert(fn_returns_type($fn, 'array'), "map " . last_assert_err());
+        assert(fn_takes_x_or_more_args($fn, 1), "map " . last_assert_err());
+
+        if (!empty($this->_value)) {
+            $this->_value = $fn($this->_value);
+        }
+        return $this;
+    }
+
+    // call the function with the value if the value is not empty 
+    // the maybe value is not changed
+    public function effect(callable $fn): MaybeA {
+        assert(fn_takes_x_or_more_args($fn, 1), "effect " . last_assert_err());
+
+        if (!empty($this->_value)) {
+            $fn($this->_value);
+        }
+        return $this;
+    }
+
+    // if the function returns false, value will be set to null
+    public function keep_if(callable $fn): MaybeA {
+        assert(fn_returns_type($fn, 'bool'), "keep_if " . last_assert_err());
+        assert(fn_takes_x_or_more_args($fn, 1), "keep_if " . last_assert_err());
+
+        if (!$fn($this->_value)) {
+            $this->_value = null;
+        }
+        return $this;
+    }
+
+    // call function $fn if the value is empty.  $fn should not require any arguments
+    // if $fn returns a value, then set the maybe value to that value
+    public function if_not(callable $fn): MaybeA {
+        assert(fn_returns_type($fn, 'bool'), "keep_if " . last_assert_err());
+        assert(fn_takes_x_or_more_args($fn, 1), "keep_if " . last_assert_err());
+
+        if (empty($this->_value)) {
+            $result = $fn($this->_value);
+            if (!empty($result)) {
+                $this->_value = $result;
+            }
+        }
+
+        return $this;
+    }
+
+    public function empty(): bool {
+        return empty($this->_value);
+    }
+
+    // return a list of methods that failed 
+    public function errors(): ?array {
+        return [];
+    }
+
+    // return the length of the string
+    public function size(): int {
+        return (!empty($this->_value)) ? count($this->_value) : 0;
     }
 }
 
@@ -1282,12 +1535,16 @@ function ident($in) { return $in; }
 
 namespace ThreadFin\Util;
 
+use Exception;
 use ReflectionFunction;
+use ThreadFin\Core\MaybeStr;
 
 use const ThreadFin\Log\ACTION_CLEAN;
 use const ThreadFin\Log\ACTION_RETURN;
 use const ThreadFin\Log\RETURN_LOG;
 
+use function ThreadFin\Core\partial;
+use function ThreadFin\Core\partial_right;
 use function ThreadFin\Log\debug;
 use function ThreadFin\Log\trace;
 
@@ -1296,6 +1553,15 @@ if (PHP_VERSION_ID < 80000) {
     function str_contains(string $haystack, string $needle) : bool {
         return strpos($haystack, $needle) !== false;
     }
+}
+
+/**
+ * generate random string of length $len
+ * @param int $len 
+ * @return string 
+ */
+function random_str(int $len) : string {
+    return substr(strtr(base64_encode(random_bytes($len)), '+/=', '___'), 0, $len);
 }
 
 // check if $haystack contains any of the strings in $needles case-sensitive
@@ -1415,6 +1681,63 @@ function accrue_arr(callable $fn) : callable {
 
 
 
+/**
+ * Encrypt string using openSSL module
+ * @param string $text the message to encrypt
+ * @param string $password the password to encrypt with
+ * @return string message.iv
+ */
+function encrypt_ssl(string $password, string $text) : string {
+    assert(strlen($password) >= 12, "password must be at least 12 characters long");
+
+    $iv = random_str(16);
+    $e = openssl_encrypt($text, 'AES-128-CBC', $password, 0, $iv) . "." . $iv;
+    return $e;
+}
+
+/**
+ * aes-128-cbc decryption of data, return raw value
+ */ 
+function raw_decrypt(string $cipher, string $iv, string $password) {
+    $decrypt = openssl_decrypt($cipher, "AES-128-CBC", $password, 0, $iv);
+    return $decrypt;
+}
+
+/**
+ * Decrypt string using openSSL module
+ * @param string $password the password to decrypt with
+ * @param string $cipher the message encrypted with encrypt_ssl
+ * @return MaybeI with the original string data 
+ */
+function decrypt_ssl(string $password, string $cipher) : MaybeStr {
+
+    assert(strlen($password) > 8, "password must be at least 8 characters long");
+    $decrypt = partial_right("ThreadFin\\util\\raw_decrypt", $password);
+
+    $a = MaybeStr::of($cipher)
+        ->map(partial("explode", "."))
+        ->keep_if(function($x) { return is_array($x) && count($x) === 2; })
+        ->map($decrypt, true);
+    return $a;
+}
+
+/**
+ * @param array|object $array the array or object to clone
+ * @return array|object the cloned array or object
+ */
+function array_clone($array) {
+    return array_map(function($element) {
+        return ((is_array($element))
+            ? array_clone($element)
+            : ((is_object($element))
+                ? clone $element
+                : $element
+            )
+        );
+    }, $array);
+}
+
+
 
 namespace ThreadFin\Assertions;
 
@@ -1450,6 +1773,11 @@ function fn_returns_type(callable $fn, string $type) : bool {
 // return true if $fn argument $index is exactly $type
 function fn_arg_x_is_type(callable $fn, int $index, string $type) : bool {
     $a = get_fn_param($fn, $index);
+    if ($a === null) {
+        last_assert_err("Function parameter #$index does not exist");
+        return false;
+    }
+    $t = $a->getType();
     $check_type = (string)$a->getType();
 
     if ($check_type !== $type) {
@@ -1460,9 +1788,18 @@ function fn_arg_x_is_type(callable $fn, int $index, string $type) : bool {
     return true;
 }
 
-// return true if $fn argument $index is or is part union of $type
+/**
+ * @param callable $fn the function to check
+ * @param int $index the parameter index to check (starting at 1)
+ * @param string $type the type is should be
+ * @return bool true if function parameter $index is of type $type
+ */
 function fn_arg_x_has_type(callable $fn, int $index, string $type) : bool {
     $a = get_fn_param($fn, $index);
+    if ($a === null) {
+        last_assert_err("Function parameter #$index does not exist");
+        return false;
+    }
     $check_type = (string)$a->getType();
 
     if (str_contains($check_type, $type)) {
@@ -1486,8 +1823,10 @@ function fn_takes_x_or_more_args(callable $fn, int $num_args) {
 // return true if $fn has has exactly $num_args arguments
 function fn_takes_x_args(callable $fn, int $num_args) {
     $ref = new \ReflectionFunction($fn);
-    if ($ref->getNumberOfParameters() == $num_args) {
-        last_assert_err("Function does not take $num_args arguments");
+    $n1 = $ref->getNumberOfRequiredParameters();
+
+    if ($n1 != $num_args) {
+        last_assert_err("Function does not take $num_args arguments (takes $n1 arguments)");
         return false;
     }
     return true;
@@ -1497,12 +1836,18 @@ function fn_takes_x_args(callable $fn, int $num_args) {
 // helper function to get a function parameter info by index
 function get_fn_param(callable $fn, int $index) : ?ReflectionParameter {
     $ref = new \ReflectionFunction($fn);
+    if ($ref->isClosure()) {
+        $c = $ref->getStaticVariables();
+        if (isset($c['fn'])) {
+            $ref = new \ReflectionFunction($c['fn']);
+        }
+    }
     $p = $ref->getParameters();
-    if (!isset($p[$index-1])) { 
+    if (!isset($p[$index])) { 
         last_assert_err("Function does not have #$index parameter");
         return null;
     }
-    return $p[$index-1];
+    return $p[$index];
 }
 
 /*
