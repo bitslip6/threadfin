@@ -5,6 +5,8 @@ use function ThreadFin\Log\trace;
 use function ThreadFin\Util\contains;
 use function ThreadFin\Util\map_reduce;
 
+namespace ThreadFin\HTTP;
+
 
 /**
  * take HTML text and convert to array of links [href => text]
