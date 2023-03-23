@@ -9,7 +9,8 @@ use Attribute;
 use Exception;
 use mysqli;
 use mysqli_result;
-use ThreadFin\MaybeA;
+use OutOfBoundsException;
+use ThreadFin\Core\MaybeA;
 use ThreadFin\Core\MaybeStr;
 
 use function ThreadFin\Util\func_name;
@@ -42,6 +43,14 @@ class NotNull { public function __construct() {} }
  */
 #[Attribute(Attribute::TARGET_CLASS_CONSTANT|Attribute::TARGET_PROPERTY)]
 class IfNull { public function __construct() {} }
+
+/**
+ * Interface from mapping SQL results to objects
+ */
+interface FromSQL {
+    #[\ReturnTypeWillChange]
+    public static function from_sql(array $sql) : mixed;
+}
 
 
 // set the error log file if running in cli mode
@@ -78,7 +87,7 @@ class Credentials {
  * if data key begins with ! then the value is not quoted
  * EG: UPDATE $table set " . glue(" = ", $data, ", ") .  where_clause($where);
  */
-function glue(string $join, array $data, string $append_str = ", ") : string {
+function glue(array $data, string $join = " = ", string $append_str = ", ") : string {
     $result = "";
     foreach ($data as $key => $value) {
         if ($result != '') { $result .= $append_str; }
@@ -244,7 +253,7 @@ class DB {
 
     /**
      * run SQL $sql return result as bool. errors stored tail($this->errors)
-     * @return -1 on error, 0 if no rows affected / no insert id, >0 if rows affected / insert id, 1 = success
+     * @return int -1 on error, 0 if no rows affected / no insert id, >0 if rows affected / insert id, 1 = success
      */
     protected function _qb(string $sql, int $return_type = DB_FETCH_SUCCESS) : int {
         assert(!empty($this->_db), "database: {$this->database} is not connected");
@@ -317,7 +326,8 @@ class DB {
             }
         }
 
-        return SQL::from(mysqli_fetch_all($r, $mode), $sql);
+        //return SQL::from(mysqli_fetch_all($r, $mode), $sql);
+        return SQL::fetch($r, $sql);
     }
 
     /**
@@ -448,7 +458,7 @@ class DB {
      * keys are column names, values are data to insert.
      * @param string $table the table name
      * @param ?array $keys list of allowed key names from the passed $data
-     * @return callable(array $data) insert $data into $table 
+     * @return callable(array $data) insert $data into $table - return newly created db id
      */
     public function insert_fn(string $table, ?array $keys = null, bool $ignore_duplicate = true, int $return_type = DB_FETCH_SUCCESS) : callable { 
         $t = $this;
@@ -461,7 +471,8 @@ class DB {
             $sql = "INSERT $ignore INTO $table (" . join(",", array_keys($data)) . 
                 ") VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))) . ")";
 
-            return $t->_qb($sql);
+            $id = $t->_qb($sql, DB_FETCH_INSERT_ID);
+            return $id;
         };
     }
 
@@ -515,7 +526,7 @@ class DB {
         array_walk($where, function ($value, $key) use (&$data) { unset($data[$key]); });
 
         // glue does the escaping for us here...
-        $sql = "UPDATE `$table` set " . glue(" = ", $data) .  where_clause($where);
+        $sql = "UPDATE `$table` set " . glue($data) .  where_clause($where);
         return $this->_qb($sql);
     }
 
@@ -611,13 +622,32 @@ class DB {
 /**
  * SQL result abstraction
  */
-class SQL {
+class SQL implements \ArrayAccess, \Iterator, \SeekableIterator {
     protected $_x;
     protected $_data = NULL;
-    protected $_idx = 0;
+    protected $_position = 0;
     protected $_errors;
     protected $_sql;
     protected $_len;
+    protected $_fetch_all;
+    protected $_mysqli_result;
+
+    public function offsetExists(mixed $offset): bool {
+        return $offset <= $this->_len;
+    }
+
+    public function offsetGet(mixed $offset): array {
+        $this->_mysqli_result->data_seek($offset);
+        return $this->_mysqli_result->fetch_assoc();
+    }
+
+    public function offsetSet(mixed $offset, mixed $value): void {
+        throw new OutOfBoundsException("set not implemented");
+    }
+
+    public function offsetUnset(mixed $offset): void {
+        throw new OutOfBoundsException("unset not implemented");
+    }
 
     /**
      * create a new SQL result abstraction from a SQL associative result
@@ -625,51 +655,74 @@ class SQL {
      * @param string $sql the sql that generated the result
      * @return SQL 
      */
-    public static function from(?array $x, string $in_sql="") : SQL { 
+    public static function from(?array $x, string $in_sql="", bool $fetch_all = true) : SQL { 
         $sql = new SQL();
         $sql->_x = $x;
         $sql->_len < (is_array($x)) ? count($x) : 0;
         $sql->_sql = $in_sql;
+        $sql->_fetch_all = $fetch_all;
         return $sql; 
     }
-    
-    /**
-     * set internal dataset to value of $name at current row index 
-     */
-    public function set_col(string $name) : SQL {
-        if (isset($this->_x[$this->_idx])) {
-            $this->_data = $this->_x[$this->_idx][$name]??NULL;
-        } else {
-            $this->_data = NULL;
-        }
 
-        return $this;
+    public static function fetch(mysqli_result $result, string $sql) : SQL {
+        $sql = new SQL();
+        $sql->_mysqli_result = $result;
+        $sql->_sql = $sql;
+        $sql->_x = $result->fetch_assoc();
+        $sql->_len = $result->num_rows;
+        return $sql;
     }
 
+    
     /**
      * set internal dataset to row  at current row index 
      */
-    public function set_row(?int $idx = NULL) : SQL {
-        $idx = ($idx !== NULL) ? $idx : $this->_idx;
-        if (isset($this->_x[$idx])) {
-            $this->_data = $this->_x[$idx];
+    public function seek(int $offset = 0) : void {
+        if (!$this->_mysqli_result->data_seek($offset)) {
+            $this->_errors[] = "seek to [$offset] failed";
         }
-        return $this;
+    }
+
+    public function current() : array {
+        return $this->_x;
+    }
+
+    public function key() : int {
+        return $this->_position;
+    }
+
+    public function next() : void {
+        $this->_position++;
+        if ($this->_mysqli_result) {
+            $this->_x = $this->_mysqli_result->fetch_assoc();
+        }
+    }
+
+    public function rewind() : void {
+        $this->_position = 0;
+        if ($this->_mysqli_result) {
+            $this->_mysqli_result->data_seek(0);
+            $this->_x = $this->_mysqli_result->fetch_assoc();
+        }
+    }
+
+    public function valid() : bool {
+        return $this->_position < $this->_len;
     }
 
     /**
      * @return MaybeStr of column $name at current row index
      */
     public function col(string $name) : MaybeStr {
-        if (isset($this->_x[$this->_idx])) {
-            return MaybeStr::of($this->_x[$this->_idx][$name]??NULL);
+        if (isset($this->_x[$this->_position])) {
+            return MaybeStr::of($this->_x[$this->_position][$name]??NULL);
         } 
         return MaybeStr::of(NULL);
     }
 
     /**
      * @return bool true if column name has a row with at least one value of $value 
-     */
+     *
     public function in_set(string $name, string $value) : bool {
         return array_reduce($this->_x, function ($carry, $item) use ($name, $value) {
             return $carry || $item[$name] == $value;
@@ -678,9 +731,9 @@ class SQL {
 
     /**
      * @return MaybeA of result row at $idx or current row indx
-     */
+     *
     public function row(?int $idx = NULL) : MaybeA {
-        $idx = ($idx !== NULL) ? $idx : $this->_idx;
+        $idx = ($idx !== NULL) ? $idx : $this->_position;
         if (isset($this->_x[$idx])) {
             return MaybeA::of($this->_x[$idx]);
         }
@@ -688,15 +741,8 @@ class SQL {
     }
 
     /**
-     * increment row index
-     */
-    public function next() : void {
-        $this->_idx++;
-    }
-
-    /**
      * return true if data has a row at index $idx
-     */
+     *
     public function has_row(int $idx = 0) : bool {
         return isset($this->_x[$idx]);
     }
@@ -704,7 +750,7 @@ class SQL {
     /**
      * call $fn on current $this->_data (see set_row, set_col)
      * @param bool $spread if true, call $fn(...$this->_data)
-     */
+     *
     public function ondata(callable $fn, bool $spread = false) : SQL {
         if (!empty($this->_data)) {
             $this->_data = 
@@ -720,7 +766,7 @@ class SQL {
 
     /**
      * map $fn on each row in entire result (works on raw result, no set necessary)
-     */
+     *
     public function map(callable $fn) : array {
         if (is_array($this->_x) && !empty($this->_x)) {
             return array_map($fn, $this->_x);
@@ -734,7 +780,7 @@ class SQL {
      * reduce $fn($carry, $item) on each row in entire result (works on raw result, no set necessary)
      * $fn may return any type, but should be a string in 99% cases
      * @return mixed return type of $fn, false if rows (_x) is empty
-     */
+     *
     public function reduce(callable $fn, $initial = "") : mixed {
         if (is_array($this->_x) && !empty($this->_x)) {
             return array_reduce($this->_x, $fn, $initial);
@@ -743,6 +789,9 @@ class SQL {
         }
         return false;
     }
+    */
+
+    /*
     // run an a function that has external effect on current data
     public function effect(callable $fn) : SQL { 
         if (!empty($this->_data)) { $fn($this->_data); } return $this;
@@ -775,6 +824,13 @@ class SQL {
     }
     public function __toString() : string {
         return (string)$this->_data;
+    }
+    */
+    public function close() {
+        if ($this->_mysqli_result) {
+            $this->_mysqli_result->free();
+        }
+        $this->_mysqli_result = null;
     }
 }
 
@@ -916,7 +972,6 @@ function dump_database(Credentials $cred, string $db_name, callable $write_fn, i
     $write_fn($header . $init_sql);
 
     $t = bind_l('\ThreadFin\DB\dump_table', $db, $write_fn);
-    $tables->map($t);
-    $data = $tables->data();
+    $data = $tables->map($t);
     return (!$data || empty($data) || !is_array($data)) ? [] : $data;
 }
