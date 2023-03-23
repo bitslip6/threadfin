@@ -1,11 +1,11 @@
 <?php
+namespace ThreadFin\HTTP;
 
 use function ThreadFin\Log\debug;
 use function ThreadFin\Log\trace;
 use function ThreadFin\Util\contains;
 use function ThreadFin\Util\map_reduce;
 
-namespace ThreadFin\HTTP;
 
 
 /**
