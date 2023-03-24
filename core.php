@@ -1548,12 +1548,29 @@ use function ThreadFin\Core\partial_right;
 use function ThreadFin\Log\debug;
 use function ThreadFin\Log\trace;
 
+enum Escape_Type : string {
+    case HTML = 'htmlspecialchars';
+    case RAW = '\ThreadFin\Core\ident';
+}
+
 // PolyFills
 if (PHP_VERSION_ID < 80000) { 
     function str_contains(string $haystack, string $needle) : bool {
         return strpos($haystack, $needle) !== false;
     }
 }
+
+function e(array $source, string $key, Escape_Type $type) : MaybeStr {
+    if (isset($source[$key])) {
+        return MaybeStr::of($type($source[$key]));
+    }
+    return MaybeStr::of(null);
+}
+
+function eg(string $get_name, Escape_Type $type = Escape_Type::HTML) { return e($_GET, $get_name, $type); }
+function ep(string $get_name, Escape_Type $type = Escape_Type::HTML) { return e($_POST, $get_name, $type); }
+function er(string $get_name, Escape_Type $type = Escape_Type::HTML) { return e($_REQUEST, $get_name, $type); }
+
 
 /**
  * generate random string of length $len
