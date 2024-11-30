@@ -5,6 +5,7 @@ use ThreadFin\Core\TF_Error;
 
 use function ThreadFin\Log\debug;
 use function ThreadFin\Log\trace2;
+use function ThreadFin\Util\dbg;
 
 require __DIR__ . "/storage.php";
 
@@ -39,9 +40,11 @@ function writer(FileChange $file) : ?TF_Error {
     $len = strlen($file->content);
     debug("FS(w) [%s] (%d)bytes", $file->filename, $len);
 
+
     // create the path if we need to
     $dir = dirname($file->filename);
     if (!file_exists($dir)) {
+        // echo "mkdir ($dir)\n";
         if (!mkdir($dir, 0755, true)) {
             return new TF_Error("unable to mkdir -r [$dir]", __FILE__, __LINE__);
         }
@@ -184,6 +187,7 @@ function debug(?string $fmt, ...$args) : ?array {
         }
     }
 
+    file_put_contents(LOG_PATH, "$line\n", FILE_APPEND | LOCK_EX);
     return null;
 }
 
@@ -192,17 +196,21 @@ function debug(?string $fmt, ...$args) : ?array {
  * @param string $path 
  * @return void 
  */
-function debug_log_file(string $path) : void {
+function debug_log_file(string $path, bool $immediate = false) : void {
     if (!defined('LOG_DEBUG_ENABLE')) {
         define ("LOG_DEBUG_ENABLE", true);
     }
+    define("LOG_IMMEDIATE", $immediate);
+    define("LOG_PATH", $path);
     if (LOG_DEBUG_ENABLE) {
+        if (!$immediate) {
         register_shutdown_function(function() use ($path) {
             $log = debug(null);
             if (empty($log)) { return; }
             $log = implode("\n", $log);
             file_put_contents($path, "$log\n", FILE_APPEND);
         });
+        }
     }
 }
 
@@ -213,6 +221,7 @@ use InvalidArgumentException;
 use OutOfBoundsException;
 use ThreadFin\File\FileChange;
 
+use const ThreadFin\DAY;
 use const ThreadFin\Log\RETURN_LOG;
 
 use function ThreadFin\Assertions\fn_arg_x_has_type;
@@ -595,7 +604,6 @@ enum EffectStatus {
 }
 
 
-
 /**
  * abstract away external effects
  */
@@ -629,7 +637,7 @@ class Effect {
     // THIS IS GLOBAL TO ALL INSTANCES OF EFFECT
     public static function set_runner(callable $fn) : void {
         assert(fn_returns_type($fn, "ThreadFin\Core\TF_ErrorList"), "Effect runner " . last_assert_err());
-        assert(fn_arg_x_is_type($fn, 1, "ThreadFin\Core\Effect"), "Effect runner " . last_assert_err());
+        assert(fn_arg_x_is_type($fn, 0, "ThreadFin\Core\Effect"), "Effect runner " . last_assert_err());
         assert(self::$runner === null, "Effect Runner can only be set 1x");
 
         self::$runner = $fn;
@@ -872,7 +880,7 @@ class Runner {
  * @param int $exp expiration time in seconds, if negative, cookie will be removed
  * @return ?TF_Error 
  */
-function TF_cookie(string $name, string $value, int $exp = 0, string $path = "/", string $domain = "", bool $secure = false, bool $httponly = true) : ?TF_Error {
+function TF_cookie(string $name, string $value, int $exp = DAY * 365, string $path = "/", string $domain = "", bool $secure = false, bool $httponly = true) : ?TF_Error {
     if (headers_sent($file, $line)) {
         return new TF_Error("unable to set cookie, headers already sent", $file, $line);
     } 
@@ -1285,14 +1293,14 @@ interface Maybe {
 }
 
 class MaybeStr implements Maybe {
-    protected ?string $_value;
+    protected $_value = null;
 
     protected function __construct($value) {
         $this->_value = $value;
     }
 
     // create a new MaybeString from a value
-    public static function of(?string $x = null): MaybeStr {
+    public static function of($x = null): MaybeStr {
         return new MaybeStr($x);
     }
 
@@ -1386,6 +1394,16 @@ class MaybeStr implements Maybe {
     public function size(): int {
         return (!empty($this->_value)) ? strlen($this->_value) : 0;
     }
+
+    public function then(callable $fn, bool $spread = false) : MaybeStr {
+        if (!empty($this->_value)) {
+            $this->_value = ($spread) ?  $fn(...$this->_value) : $fn($this->_value);
+        }
+
+        return $this;
+    }
+
+    public function __invoke(string $type = null) { return $this->value($type); }
 }
 
 class MaybeA implements Maybe {
@@ -1512,6 +1530,17 @@ function pipeline(callable $a, callable $b) {
         return array_reduce($list, function ($accumulator, callable $a) {
             return $a($accumulator);
         }, $value);
+    };
+}
+
+
+function chain_fn(callable $fn1, ?callable $fn2 = NULL) : callable {
+    return function (...$x) use ($fn1, $fn2) {
+        $result = $fn1(...$x);
+        if ($fn2 != NULL) {
+            $result = $fn2($result);
+        }
+        return $result;
     };
 }
 
@@ -1754,6 +1783,11 @@ function array_clone($array) {
     }, $array);
 }
 
+
+// return the n'th element of an array
+function take_n(array $array, int $n) : array {
+    return array_slice($array, 0, $n);
+}
 
 
 namespace ThreadFin\Assertions;
