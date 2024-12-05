@@ -5,6 +5,7 @@ use ThreadFin\Core\TF_Error;
 
 use function ThreadFin\Log\debug;
 use function ThreadFin\Log\trace2;
+use function ThreadFin\Util\dbg;
 
 require __DIR__ . "/storage.php";
 
@@ -39,9 +40,11 @@ function writer(FileChange $file) : ?TF_Error {
     $len = strlen($file->content);
     debug("FS(w) [%s] (%d)bytes", $file->filename, $len);
 
+
     // create the path if we need to
     $dir = dirname($file->filename);
     if (!file_exists($dir)) {
+        // echo "mkdir ($dir)\n";
         if (!mkdir($dir, 0755, true)) {
             return new TF_Error("unable to mkdir -r [$dir]", __FILE__, __LINE__);
         }
@@ -184,6 +187,7 @@ function debug(?string $fmt, ...$args) : ?array {
         }
     }
 
+    file_put_contents(LOG_PATH, "$line\n", FILE_APPEND | LOCK_EX);
     return null;
 }
 
@@ -192,17 +196,21 @@ function debug(?string $fmt, ...$args) : ?array {
  * @param string $path 
  * @return void 
  */
-function debug_log_file(string $path) : void {
+function debug_log_file(string $path, bool $immediate = false) : void {
     if (!defined('LOG_DEBUG_ENABLE')) {
         define ("LOG_DEBUG_ENABLE", true);
     }
+    define("LOG_IMMEDIATE", $immediate);
+    define("LOG_PATH", $path);
     if (LOG_DEBUG_ENABLE) {
+        if (!$immediate) {
         register_shutdown_function(function() use ($path) {
             $log = debug(null);
             if (empty($log)) { return; }
             $log = implode("\n", $log);
             file_put_contents($path, "$log\n", FILE_APPEND);
         });
+        }
     }
 }
 
@@ -211,8 +219,10 @@ namespace ThreadFin\Core;
 
 use InvalidArgumentException;
 use OutOfBoundsException;
+use ReturnTypeWillChange;
 use ThreadFin\File\FileChange;
 
+use const ThreadFin\DAY;
 use const ThreadFin\Log\RETURN_LOG;
 
 use function ThreadFin\Assertions\fn_arg_x_has_type;
@@ -265,14 +275,14 @@ abstract class Typed_List implements \ArrayAccess, \Iterator, \Countable, \Seeka
      * @return $this->_type cast this to your subclass type
      */
     #[\ReturnTypeWillChange]
-    public abstract function offsetGet($index);
+    public abstract function offsetGet(mixed $index): mixed;
 
     /**
      * Example: foreach ($list as $key => $value)
      * @return mixed cast this to your subclass type at the current iterator index
      */
     #[\ReturnTypeWillChange]
-    public abstract function current();
+    public abstract function current(): mixed;
 
 
     /**
@@ -595,7 +605,6 @@ enum EffectStatus {
 }
 
 
-
 /**
  * abstract away external effects
  */
@@ -629,7 +638,7 @@ class Effect {
     // THIS IS GLOBAL TO ALL INSTANCES OF EFFECT
     public static function set_runner(callable $fn) : void {
         assert(fn_returns_type($fn, "ThreadFin\Core\TF_ErrorList"), "Effect runner " . last_assert_err());
-        assert(fn_arg_x_is_type($fn, 1, "ThreadFin\Core\Effect"), "Effect runner " . last_assert_err());
+        assert(fn_arg_x_is_type($fn, 0, "ThreadFin\Core\Effect"), "Effect runner " . last_assert_err());
         assert(self::$runner === null, "Effect Runner can only be set 1x");
 
         self::$runner = $fn;
@@ -872,7 +881,7 @@ class Runner {
  * @param int $exp expiration time in seconds, if negative, cookie will be removed
  * @return ?TF_Error 
  */
-function TF_cookie(string $name, string $value, int $exp = 0, string $path = "/", string $domain = "", bool $secure = false, bool $httponly = true) : ?TF_Error {
+function TF_cookie(string $name, string $value, int $exp = DAY * 365, string $path = "/", string $domain = "", bool $secure = false, bool $httponly = true) : ?TF_Error {
     if (headers_sent($file, $line)) {
         return new TF_Error("unable to set cookie, headers already sent", $file, $line);
     } 
@@ -1272,27 +1281,29 @@ function file_recurse(string $dirname, string $include_regex_filter = NULL, stri
 
 interface Maybe {
     public function value() : mixed;
-    // public function of($x) : Maybe;
+    public static function of($x) : Maybe;
 
     public function map(callable $fn) : Maybe;
     public function effect(callable $fn) : Maybe;
     public function keep_if(callable $fn) : Maybe;
     public function if_not(callable $fn) : Maybe;
+    public function convert(callable $fn) : mixed;
 
     public function empty() : bool;
     public function errors() : ?array;
     public function size() : int;
 }
 
+
 class MaybeStr implements Maybe {
-    protected ?string $_value;
+    protected $_value = null;
 
     protected function __construct($value) {
         $this->_value = $value;
     }
 
     // create a new MaybeString from a value
-    public static function of(?string $x = null): MaybeStr {
+    public static function of($x = null): MaybeStr {
         return new MaybeStr($x);
     }
 
@@ -1386,7 +1397,14 @@ class MaybeStr implements Maybe {
     public function size(): int {
         return (!empty($this->_value)) ? strlen($this->_value) : 0;
     }
+
+    public function convert(callable $fn) : mixed {
+        return (!empty($this->_value)) ? $fn($this->_value) : NULL;
+    }
+
+    public function __invoke(string $type = null) { return $this->value($type); }
 }
+
 
 class MaybeA implements Maybe {
     protected ?array $_value;
@@ -1396,7 +1414,8 @@ class MaybeA implements Maybe {
     }
 
     // create a new MaybeString from a value
-    public static function of(?array $x = null): MaybeA {
+    public static function of($x): MaybeA {
+        assert(is_array($x) || is_null($x), "MaybeA only accepts type ?array");
         return new MaybeA($x);
     }
 
@@ -1467,6 +1486,107 @@ class MaybeA implements Maybe {
     public function size(): int {
         return (!empty($this->_value)) ? count($this->_value) : 0;
     }
+
+    public function convert(callable $fn) : mixed {
+        return (!empty($this->_value)) ? $fn($this->_value) : NULL;
+    }
+
+    public function splat(callable $fn) : Maybe {
+        if (!empty($this->_value)) {
+            $this->_value = $fn(...$this->_value);
+        }
+
+        return $this;
+    }
+}
+
+class MaybeO implements Maybe {
+    protected object $_value;
+
+    protected function __construct(object $value) {
+        $this->_value = $value;
+    }
+
+    // create a new MaybeString from a value
+    public static function of($x): MaybeO {
+        return new MaybeO($x);
+    }
+
+    // return the value of the maybe
+    public function value(): ?object {
+        return $this->_value;
+    }
+
+    // applying the function to the value if the value is not empty
+    public function map(callable $fn): MaybeO {
+        assert(fn_takes_x_or_more_args($fn, 1), "map " . last_assert_err());
+
+        if (!empty($this->_value)) {
+            $this->_value = $fn($this->_value);
+        }
+        return $this;
+    }
+
+    // call the function with the value if the value is not empty 
+    // the maybe value is not changed
+    public function effect(callable $fn): MaybeO {
+        assert(fn_takes_x_or_more_args($fn, 1), "effect " . last_assert_err());
+
+        if (!empty($this->_value)) {
+            $fn($this->_value);
+        }
+        return $this;
+    }
+
+    // if the function returns false, value will be set to null
+    public function keep_if(callable $fn): MaybeO {
+        assert(fn_returns_type($fn, 'bool'), "keep_if " . last_assert_err());
+        assert(fn_takes_x_or_more_args($fn, 1), "keep_if " . last_assert_err());
+
+        if (!$fn($this->_value)) {
+            $this->_value = null;
+        }
+        return $this;
+    }
+
+    // call function $fn if the value is empty.  $fn should not require any arguments
+    // if $fn returns a value, then set the maybe value to that value
+    public function if_not(callable $fn): MaybeO {
+        assert(fn_returns_type($fn, 'bool'), "keep_if " . last_assert_err());
+        assert(fn_takes_x_or_more_args($fn, 1), "keep_if " . last_assert_err());
+
+        if (empty($this->_value)) {
+            $result = $fn($this->_value);
+            if (!empty($result)) {
+                $this->_value = $result;
+            }
+        }
+
+        return $this;
+    }
+
+    public function convert(callable $fn) : mixed {
+        return (!empty($this->_value)) ? $fn($this->_value) : NULL;
+    }
+
+
+    public function empty(): bool {
+        return empty($this->_value);
+    }
+
+    // return a list of methods that failed 
+    public function errors(): ?array {
+        return [];
+    }
+
+    // return the length of the string
+    public function size(): int {
+        return (!empty($this->_value)) ? count($this->_value) : 0;
+    }
+
+    public function __invoke() : ?Object {
+        return $this->_value;
+    }
 }
 
 
@@ -1515,6 +1635,17 @@ function pipeline(callable $a, callable $b) {
     };
 }
 
+
+function chain_fn(callable $fn1, ?callable $fn2 = NULL) : callable {
+    return function (...$x) use ($fn1, $fn2) {
+        $result = $fn1(...$x);
+        if ($fn2 != NULL) {
+            $result = $fn2($result);
+        }
+        return $result;
+    };
+}
+
 /**
  * compose functions in forward order
  */
@@ -1560,11 +1691,24 @@ if (PHP_VERSION_ID < 80000) {
     }
 }
 
+// escape the variable $key in array source $source with escaping from Escape_Type
 function e(array $source, string $key, Escape_Type $type) : MaybeStr {
     if (isset($source[$key])) {
         return MaybeStr::of($type($source[$key]));
     }
     return MaybeStr::of(null);
+}
+
+// die($panic_message) if $fn is true
+function panic_if(bool $value, string $panic_message) : void {
+    if ($value) {
+        die("$panic_message\n");
+    }
+}
+
+// negate the return type of $fn()
+function not(bool $input) : bool {
+    return !$input;
 }
 
 function eg(string $get_name, Escape_Type $type = Escape_Type::HTML) { return e($_GET, $get_name, $type); }
@@ -1754,6 +1898,11 @@ function array_clone($array) {
     }, $array);
 }
 
+
+// return the n'th element of an array
+function take_n(array $array, int $n) : array {
+    return array_slice($array, 0, $n);
+}
 
 
 namespace ThreadFin\Assertions;

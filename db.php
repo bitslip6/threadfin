@@ -106,7 +106,7 @@ function quote($input) : string {
     if (is_null($input)) { return 'null'; }
     if (is_numeric($input)) { return strval($input); }
     if (is_string($input)) { return "'".addslashes($input)."'"; }
-    if (is_bool($input)) { return $input ? 1 : 0; }
+    if (is_bool($input)) { return $input ? '1' : '0'; }
     if (is_array($input)) { return implode(',', array_map('\ThreadFin\DB\quote', $input)); }
     $x = (string)$input;
     debug("implicit quote cast to string: [%s]", $x);
@@ -156,6 +156,10 @@ class DB {
 
     public function __destruct() {
         if ($this->_db) { $this->close(); }
+    }
+
+    public function connected() : bool {
+        return (!empty($this->_db));
     }
 
     /**
@@ -417,6 +421,7 @@ class DB {
 
         $sql = "INSERT $ignore INTO `$table` (`" . join("`,`", array_keys($data)) . 
         "`) VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))).")";
+        // echo "$sql\n";
 
         // update on duplicate, exclude any PKS
         if ($on_duplicate === DB_DUPLICATE_UPDATE) {
@@ -462,14 +467,20 @@ class DB {
      */
     public function insert_fn(string $table, ?array $keys = null, bool $ignore_duplicate = true, int $return_type = DB_FETCH_SUCCESS) : callable { 
         $t = $this;
-        return function(array $data) use ($table, &$t, $keys, $ignore_duplicate) : int {
-            // filter out unwanted key/values
-            if (!empty($keys)) {
-                $data = array_filter($data, bind_r('in_array', $keys), ARRAY_FILTER_USE_KEY);
+        $ignore = ($ignore_duplicate) ? "IGNORE" : "";
+        $prefix = "INSERT $ignore INTO $table ";
+        return function(array $data) use ($prefix, &$t, $keys) : int {
+            // set flag to ignore dupliactes
+            if (array_is_list($data)) {
+                $sql = "$prefix VALUES (" . join(",", array_map('\ThreadFin\DB\quote', $data)) . ")";
+            } else {
+                // filter out unwanted key/values
+                if (!empty($keys)) {
+                    $data = array_filter($data, bind_r('in_array', $keys), ARRAY_FILTER_USE_KEY);
+                }
+                $sql = "$prefix (" . join(",", array_keys($data)) . 
+                    ") VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))) . ")";
             }
-            $ignore = ($ignore_duplicate) ? "IGNORE" : "";
-            $sql = "INSERT $ignore INTO $table (" . join(",", array_keys($data)) . 
-                ") VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))) . ")";
 
             $id = $t->_qb($sql, DB_FETCH_INSERT_ID);
             return $id;
@@ -503,7 +514,6 @@ class DB {
                     $sql .= quote($data[$key_name]);
                     $sql .= (++$column_count < $num_columns) ? "," : "),\n";
                 }
-                return $ctr;
             }
             if ($ctr > 0 || $ctr > DB_MAX_BULK_INSERT) {
                 $stmt = "INSERT $ignore INTO $table (" . join(",", array_keys($columns)) . ") VALUES " . substr($sql, 0, -2);
@@ -511,7 +521,7 @@ class DB {
                 $sql = "";
                 return $t->_qb($stmt);
             }
-            return 0;
+            return $ctr;
         };
     }
 
@@ -519,15 +529,16 @@ class DB {
 
     /**
      * update $table and set $data where $where
+     * @return int num updated rows (determined by $return_type parameter)
      */
-    public function update(string $table, array $data, array $where) : int {
+    public function update(string $table, array $data, array $where, int $return_type = DB_FETCH_NUM_ROWS) : int {
         // unset all where keys in data. this makes no sense when where is a PK
         //do_for_all_key($where, function ($x) use (&$data) { unset($data[$x]); });
         array_walk($where, function ($value, $key) use (&$data) { unset($data[$key]); });
 
         // glue does the escaping for us here...
         $sql = "UPDATE `$table` set " . glue($data) .  where_clause($where);
-        return $this->_qb($sql);
+        return $this->_qb($sql, $return_type);
     }
 
     /**
@@ -612,8 +623,6 @@ class DB {
                 }
             }
             //file_put_contents($this->_replay_file, "\n".implode(";\n", $this->logs).";\n", FILE_APPEND);
-        } else {
-            echo "empty replay log\n";
         }
     }
 }
@@ -622,7 +631,7 @@ class DB {
 /**
  * SQL result abstraction
  */
-class SQL implements \ArrayAccess, \Iterator, \SeekableIterator {
+class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
     protected $_x;
     protected $_data = NULL;
     protected $_position = 0;
@@ -631,6 +640,18 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator {
     protected $_len;
     protected $_fetch_all;
     protected $_mysqli_result;
+
+    public function count(): int {
+        return intval(mysqli_num_rows($this->_mysqli_result));
+    }
+
+    public function empty(): bool {
+        return ($this->count() == 0);
+    }
+
+    public function as_array(): array {
+        return mysqli_fetch_all($this->_mysqli_result, MYSQLI_ASSOC);
+    }
 
     public function offsetExists(mixed $offset): bool {
         return $offset <= $this->_len;

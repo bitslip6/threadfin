@@ -17,3 +17,5 @@ const FILE_R  = 0444;
 const FILE_RW = 0664;
 const FILE_EX = 0775;
 
+const DAY = 86400;
+
