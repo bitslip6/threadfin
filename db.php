@@ -10,6 +10,7 @@ use Exception;
 use mysqli;
 use mysqli_result;
 use OutOfBoundsException;
+use RuntimeException;
 use ThreadFin\Core\MaybeA;
 use ThreadFin\Core\MaybeStr;
 
@@ -404,12 +405,12 @@ class DB {
 
     /**
      * helper function to create an insert statement
-     * @param string $table 
-     * @param array $data 
-     * @param int $on_duplicate 
-     * @param null|array $no_update 
-     * @param null|array $if_null 
-     * @return string 
+     * @param string $table table name to insert
+     * @param array $data key value pairs column -> data
+     * @param int $on_duplicate, must be one of DB_DUPLICATE_IGNORE, DB_DUPLICATE_UPDATE
+     * @param null|array $no_update kvp of column names to not update on duplicate, key is column name value is true
+     * @param null|array $if_null kvp of column names to only update if there are null, key is column name value is true
+     * @return string - the resulting SQL
      */
     protected function insert_stmt(string $table, array $data, int $on_duplicate = DB_DUPLICATE_IGNORE, ?array $no_update = null, ?array $if_null = null) : string {
         
@@ -419,14 +420,19 @@ class DB {
             $ignore = "IGNORE";
         }
 
-        $sql = "INSERT $ignore INTO `$table` (`" . join("`,`", array_keys($data)) . 
-        "`) VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))).")";
-        // echo "$sql\n";
+        if (array_is_list($data)) {
+            $sql = "INSERT $ignore INTO `$table` (`" . join("`,`", array_keys($data)) . 
+            "`) VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))).")";
+        } else {
+            $sql = "INSERT $ignore INTO `$table` VALUES (" . join(",", array_map('\ThreadFin\DB\quote', $data)).")";
+        }
 
         // update on duplicate, exclude any PKS
         if ($on_duplicate === DB_DUPLICATE_UPDATE) {
+            if (!array_is_list($data)) {
+                throw new RuntimeException('Can only update on duplicate update with KVP for $data');
+            }
             $update_data = array_diff_key($data, $no_update);
-            // UGLY AF
             $suffix = "";
             foreach($update_data as $key => $value) {
                 $q_value = quote($value);
