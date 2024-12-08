@@ -22,7 +22,7 @@ class Basic_Array implements ArrayAccess {
     }
 
     #[\ReturnTypeWillChange]
-    public function offsetGet($offset) {
+    public function offsetGet($offset) : mixed {
         return $this->$offset;
     }
 
@@ -430,47 +430,47 @@ function http3(string $method, string $url, $data = "", array $optional_headers 
 }
 
 function http4(string $method, string $url, $data, ?array $optional_headers = []) {
-$m0 = microtime(true);
+    $m0 = microtime(true);
 
-$optional_headers = new_headers($optional_headers, $url);
+    $optional_headers = new_headers($optional_headers, $url);
 
-// startup curl library
-$ch = \curl_init();
+    // startup curl library
+    $ch = \curl_init();
 
-debug("http3 $url");
+    debug("http3 $url");
 
-// build the post content
-$content = (is_array($data)) ? http_build_query($data) : $data;
-if ($method == "POST") {
-    \curl_setopt($ch, CURLOPT_POST, 1);
-    \curl_setopt($ch, CURLOPT_POSTFIELDS, $content);
-} else {
-    $prefix = contains($url, ['?']) ? "&" : "?";
-    $url .= $prefix . $content;
-    if ($method == "HEAD") {
-        \curl_setopt($ch, CURLOPT_NOBODY, 1);
+    // build the post content
+    $content = (is_array($data)) ? http_build_query($data) : $data;
+    if ($method == "POST") {
+        \curl_setopt($ch, CURLOPT_POST, 1);
+        \curl_setopt($ch, CURLOPT_POSTFIELDS, $content);
+    } else {
+        $prefix = contains($url, ['?']) ? "&" : "?";
+        $url .= $prefix . $content;
+        if ($method == "HEAD") {
+            \curl_setopt($ch, CURLOPT_NOBODY, 1);
+        }
     }
+
+    // set the url
+    \curl_setopt($ch, CURLOPT_URL, $url);
+    \curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+
+    // map the headers
+    if ($optional_headers != NULL) {
+        $headers = map_reduce($optional_headers, function($key, $value, $carry) { $carry[] = "$key: $value"; return $carry; }, []);
+        \curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    }
+
+    // Receive server response ...
+    \curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    \curl_setopt($ch, CURLINFO_HEADER_OUT, false);
+    \curl_setopt($ch, CURLOPT_HEADER, false);
+
+    return $ch;
 }
 
-// set the url
-\curl_setopt($ch, CURLOPT_URL, $url);
-\curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-
-// map the headers
-if ($optional_headers != NULL) {
-    $headers = map_reduce($optional_headers, function($key, $value, $carry) { $carry[] = "$key: $value"; return $carry; }, []);
-    \curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-}
-
-// Receive server response ...
-\curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-\curl_setopt($ch, CURLINFO_HEADER_OUT, false);
-\curl_setopt($ch, CURLOPT_HEADER, false);
-
-return $ch;
-}
-
-function http_wait($mh) : array {
+function http_wait($mh) : void {
 
     if (!empty($mh)) {
         $active = null;
@@ -490,5 +490,27 @@ function http_wait($mh) : array {
             }
         }
     }
+}
+
+function cache_http(string $cache_dir, int $ttl, string $method, string $url, array $data = [], array $headers = []) : string {
+    $key = md5($method . $url);
+    $cache_file = $cache_dir . "/$key";
+
+    $x = false;
+    // get the cached file
+    if (file_exists($cache_file)) {
+        if (filemtime($cache_file) > (time() - $ttl)) {
+            $x = file_get_contents($cache_file);
+        }
+    }
+
+    // get the file from the origin
+    if ($x === false) {
+        $response = http2($method, $url, $data, $headers);
+        file_put_contents($cache_file, $response->content, LOCK_EX);
+        $x = $response->content;
+    }
+
+    return (!empty($x)) ? $x : "";
 }
 
