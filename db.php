@@ -471,7 +471,7 @@ class DB {
      * @param ?array $keys list of allowed key names from the passed $data
      * @return callable(array $data) insert $data into $table - return newly created db id
      */
-    public function insert_fn(string $table, ?array $keys = null, bool $ignore_duplicate = true, int $return_type = DB_FETCH_SUCCESS) : callable { 
+    public function insert_fn(string $table, ?array $keys = null, bool $ignore_duplicate = true) : callable { 
         $t = $this;
         $ignore = ($ignore_duplicate) ? "IGNORE" : "";
         $prefix = "INSERT $ignore INTO $table ";
@@ -492,6 +492,46 @@ class DB {
             return $id;
         };
     }
+
+    /**
+     * return a function that will upsert key value pairs into $table. will always return the PK id for the row effected 
+     * keys are column names, values are data to insert.
+     * @param string $table the table name
+     * @param ?array $keys list of allowed key names from the passed $data
+     * @return callable(array $data) insert $data into $table - return newly created db id
+     */
+    public function upsert_fn(string $table, ?array $keys = null, string $pk = "id") : callable { 
+        $t = $this;
+        $prefix = "INSERT INTO $table ";
+        return function(array $data) use ($prefix, &$t, $keys, $pk) : int {
+            // set flag to ignore dupliactes
+            if (array_is_list($data)) {
+                $sql = "$prefix VALUES (" . join(',', array_map('\ThreadFin\DB\quote', $data)) . ')';
+            } else {
+                // filter out unwanted key/values
+                if (!empty($keys)) {
+                    $data = array_filter($data, bind_r('in_array', $keys), ARRAY_FILTER_USE_KEY);
+                }
+                $sql = "$prefix (" . join(',', array_keys($data)) .  ') VALUES (';
+                foreach ($data as $column => $value) {
+                    if ($column[0] === '!') {
+                        $sql .= $data ;
+                    } else {
+                        $sql .= quote($value);
+                    }
+                    $sql .= ', ';
+                }
+                $sql = trim($sql, ' ,') . ')';
+            }
+
+            $sql .= " ON DUPLICATE KEY UPDATE $pk = LAST_INSERT_ID($pk)";
+
+            $id = $t->_qb($sql, DB_FETCH_INSERT_ID);
+            echo "[$sql] = $id\n";
+            return $id;
+        };
+    }
+
 
     /**
      * TODO: test if we can just pass $this->qb to the closure, instead of $this

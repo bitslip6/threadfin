@@ -507,6 +507,10 @@ function cache_http(string $cache_dir, int $ttl, string $method, string $url, ar
     // get the file from the origin
     if ($x === false) {
         $response = http2($method, $url, $data, $headers);
+        if (!$response->success) {
+            print_r($response);
+            die("cache http failed!\n");
+        }
         file_put_contents($cache_file, $response->content, LOCK_EX);
         $x = $response->content;
     }
