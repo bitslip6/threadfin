@@ -512,16 +512,24 @@ class DB {
                 if (!empty($keys)) {
                     $data = array_filter($data, bind_r('in_array', $keys), ARRAY_FILTER_USE_KEY);
                 }
-                $sql = "$prefix (" . join(',', array_keys($data)) .  ') VALUES (';
+                //$sql = "$prefix (" . join(',', array_keys($data)) .  ') VALUES (';
+				$key_names = "";
+				$values = "";
                 foreach ($data as $column => $value) {
+
                     if ($column[0] === '!') {
-                        $sql .= $data ;
+						$key_names .= substr($column, 1);
+                        $values .= $value;
                     } else {
-                        $sql .= quote($value);
+						$key_names .= $column;
+                        $values .= quote($value);
                     }
-                    $sql .= ', ';
+                    $values .= ', ';
+                    $key_names .= ', ';
                 }
-                $sql = trim($sql, ' ,') . ')';
+                $values = trim($values, ' ,');
+                $key_names = trim($key_names, ' ,');
+				$sql = "$prefix ($key_names) VALUES ($values)";
             }
 
             $sql .= " ON DUPLICATE KEY UPDATE $pk = LAST_INSERT_ID($pk)";

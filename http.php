@@ -508,6 +508,7 @@ function cache_http(string $cache_dir, int $ttl, string $method, string $url, ar
     if ($x === false) {
         $response = http2($method, $url, $data, $headers);
         if (!$response->success) {
+            print_r($headers);
             print_r($response);
             die("cache http failed!\n");
         }
