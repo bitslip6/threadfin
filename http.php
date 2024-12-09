@@ -500,7 +500,9 @@ function cache_http(string $cache_dir, int $ttl, string $method, string $url, ar
     // get the cached file
     if (file_exists($cache_file)) {
         if (filemtime($cache_file) > (time() - $ttl)) {
-            $x = file_get_contents($cache_file);
+            $f = bzopen($cache_file, "r");
+            $x = bzread($f, 1024*1024*16);
+            bzclose($f);
         }
     }
 
@@ -508,10 +510,13 @@ function cache_http(string $cache_dir, int $ttl, string $method, string $url, ar
     if ($x === false) {
         $response = http2($method, $url, $data, $headers);
         if (!$response->success) {
+            print_r($headers);
             print_r($response);
             die("cache http failed!\n");
         }
-        file_put_contents($cache_file, $response->content, LOCK_EX);
+        $f = bzopen($cache_file, "w+");
+        bzwrite($f, $response->content, 1024*1024*16);
+        bzclose($f);
         $x = $response->content;
     }
 
