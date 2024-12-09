@@ -128,6 +128,7 @@ function http2(string $method, string $url, $data = "", array $optional_headers 
     $ch = \curl_init();
     // fall back to non-curl if library fails
     if (!$ch) {
+        echo "HTTP 1.0!\n";
         $c = http($method, $url, $data, $optional_headers);
         $len = strlen($c->content);
         return http_response($c->content, $url, ["http/1.1 200"], $len, ($len > 0));
@@ -300,8 +301,6 @@ function http2(string $method, string $url, $data = "", array $optional_headers 
     }
     */
     \curl_close($ch);
-
-
 
     $response = http_response($server_output, $url, $resp_headers, strlen($server_output), (empty($info)) ? false : true);
     // if ($proxy) { print_r($response); }
@@ -499,7 +498,7 @@ function cache_http(string $cache_dir, int $ttl, string $method, string $url, ar
     $x = false;
     // get the cached file
     if (file_exists($cache_file)) {
-        if (filemtime($cache_file) > (time() - $ttl)) {
+        if (filesize($cache_file) > 10 && filemtime($cache_file) > (time() - $ttl)) {
             $f = bzopen($cache_file, "r");
             $x = bzread($f, 1024*1024*16);
             bzclose($f);
@@ -512,13 +511,14 @@ function cache_http(string $cache_dir, int $ttl, string $method, string $url, ar
         if (!$response->success) {
             print_r($headers);
             print_r($response);
-            die("cache http failed!\n");
+            echo("cache http failed!\n");
+        } else if (strlen($response->content) > 10) {
+			unlink($cache_file);
+            $f = bzopen($cache_file, "w");
+            bzwrite($f, $response->content, 1024*1024*16);
+            bzclose($f);
+            file_put_contents("$cache_file.json", $response->content);
         }
-		unlink($cache_file);
-        $f = bzopen($cache_file, "w");
-        bzwrite($f, $response->content, 1024*1024*16);
-        bzclose($f);
-		file_put_contents("$cache_file.json", $response->content);
         $x = $response->content;
     }
 

@@ -1501,7 +1501,7 @@ class MaybeA implements Maybe {
 }
 
 class MaybeO implements Maybe {
-    protected object $_value;
+    protected ?object $_value;
 
     protected function __construct(?object $value) {
         $this->_value = $value;
