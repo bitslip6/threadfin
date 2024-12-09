@@ -125,7 +125,7 @@ function where_clause(array $data) : string {
     $result = " WHERE ";
     foreach ($data as $key => $value) {
         if (strlen($result) > 7) { $result .= " AND "; }
-        if ($key[0] == '!') {
+        if (is_string($key) && $key[0] === '!') {
             $t = substr($key, 1);
             $result .= " `{$t}` = {$value} ";
         } else {
