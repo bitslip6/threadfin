@@ -696,6 +696,9 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
     protected $_mysqli_result;
 
     public function count(): int {
+        if (empty($this->_mysqli_result)) {
+            return 0;
+        }
         return intval(mysqli_num_rows($this->_mysqli_result));
     }
 
