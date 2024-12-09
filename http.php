@@ -495,33 +495,32 @@ function cache_http(string $cache_dir, int $ttl, string $method, string $url, ar
     $key = md5($method . $url);
     $cache_file = $cache_dir . "/$key";
 
-    $x = false;
     // get the cached file
     if (file_exists($cache_file)) {
         if (filesize($cache_file) > 10 && filemtime($cache_file) > (time() - $ttl)) {
             $f = bzopen($cache_file, "r");
             $x = bzread($f, 1024*1024*16);
             bzclose($f);
+			echo " ++++ cached url: $url\n";
+            return $x;
         }
     }
 
-    // get the file from the origin
-    if ($x === false) {
-        $response = http2($method, $url, $data, $headers);
-        if (!$response->success) {
-            print_r($headers);
-            print_r($response);
-            echo("cache http failed!\n");
-        } else if (strlen($response->content) > 10) {
-			unlink($cache_file);
-            $f = bzopen($cache_file, "w");
-            bzwrite($f, $response->content, 1024*1024*16);
-            bzclose($f);
-            file_put_contents("$cache_file.json", $response->content);
-        }
-        $x = $response->content;
+	$response = http2($method, $url, $data, $headers);
+    if (!$response->success) {
+        print_r($headers);
+        print_r($response);
+        echo(" !!!!! cache http failed!!!! \n");
+        sleep(1);
+        return "";
+    } else if (strlen($response->content) > 10) {
+        $f = bzopen($cache_file, "w");
+        bzwrite($f, $response->content, strlen($response->content));
+        bzclose($f);
+        $len = file_put_contents("$cache_file.raw", $response->content);
+		echo " ++++ wrote $len, url: $url\n";
+        return $response->content;
     }
-
-    return (!empty($x)) ? $x : "";
+    return "";
 }
 
