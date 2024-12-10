@@ -409,23 +409,21 @@ class DB {
      * @param array $kvp column name value pairs
      * @return string the resulting SQL 
      */
-    function insert_sql(array $kvp) : string {
+    private function insert_sql(array $kvp) : string {
         $key_names = "";
         $values = "";
-        foreach ($kvp as $key => $value) {
-            foreach ($kvp as $column => $value) {
+		foreach ($kvp as $column => $value) {
 
-                if ($column[0] === '!') {
-                    $column = substr($column, 1);
-                } else {
-                    $value = quote($value);
-                }
-                $key_names .= $column . ', ';
-                $values .= $value . ', ';
-            }
-            $values = trim($values, ' ,');
-            $key_names = trim($key_names, ' ,');
-        }
+			if ($column[0] === '!') {
+				$column = substr($column, 1);
+			} else {
+				$value = quote($value);
+			}
+			$key_names .= $column . ', ';
+			$values .= $value . ', ';
+		}
+		$values = trim($values, ' ,');
+		$key_names = trim($key_names, ' ,');
         return "($key_names) VALUES ($values)";
     }
 
@@ -448,7 +446,7 @@ class DB {
         }
 
         if (! array_is_list($data)) {
-            $value_sql = insert_sql($data);
+            $value_sql = $this->insert_sql($data);
             $sql = "INSERT $ignore INTO `$table` $value_sql ";//(`" . join("`,`", array_keys($data)) . 
             //"`) VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))).")";
         } else {
@@ -564,7 +562,7 @@ class DB {
 
             $sql .= " ON DUPLICATE KEY UPDATE $pk = LAST_INSERT_ID($pk)";
             if (!empty($update)) {
-                $sql .= $update;
+                $sql .= ", $update";
             }
 
             $id = $t->_qb($sql, DB_FETCH_INSERT_ID);
