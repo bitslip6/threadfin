@@ -519,17 +519,15 @@ class DB {
                 foreach ($data as $column => $value) {
 
                     if ($column[0] === '!') {
-                        $col = substr($column, 1);
-						$key_names .= $col;
-                        $values .= $value;
-                        $update .= "$col = $value, ";
+                        $column = substr($column, 1);
                     } else {
-						$key_names .= $column;
-                        $values .= quote($value);
+                        $value = quote($value);
+                    }
+                    $key_names .= $column . ', ';
+                    $values .= $value . ', ';
+                    if (!empty($value)) {
                         $update .= "$column = $value, ";
                     }
-                    $values .= ', ';
-                    $key_names .= ', ';
                 }
                 $values = trim($values, ' ,');
                 $key_names = trim($key_names, ' ,');
