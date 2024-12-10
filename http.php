@@ -500,10 +500,9 @@ function cache_http(string $cache_dir, int $ttl, string $method, string $url, ar
         if (filesize($cache_file) > 10 && filemtime($cache_file) > (time() - $ttl)) {
             $f = bzopen($cache_file, "r");
             $x = "";
-            while ($t = bzread($f, 1024*1024*16) !== false) {
-                $sz = strlen($t);
-                echo " ^^^ BZREAD: $sz\n";
-                $x .= $t;
+            $ctr = 0;
+            while (!feof($f) && $ctr++ < 1024) {
+                $x .= bzread($f, 64*1024);
             }
             bzclose($f);
             return $x;
@@ -525,7 +524,6 @@ function cache_http(string $cache_dir, int $ttl, string $method, string $url, ar
         $f = bzopen($cache_file, "w");
         $sz = bzwrite($f, $response->content, strlen($response->content));
         bzclose($f);
-        echo " ^^^ wrote $sz to $cache_file\n";
         file_put_contents("$cache_file.raw", $response->content);
         return $response->content;
     }
