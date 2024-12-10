@@ -404,6 +404,33 @@ class DB {
     }
 
     /**
+     * return a (key name) values (...) SQL string
+     * with correct escaping and handling for ! column names
+     * @param array $kvp column name value pairs
+     * @return string the resulting SQL 
+     */
+    function insert_sql(array $kvp) : string {
+        $key_names = "";
+        $values = "";
+        foreach ($kvp as $key => $value) {
+            foreach ($kvp as $column => $value) {
+
+                if ($column[0] === '!') {
+                    $column = substr($column, 1);
+                } else {
+                    $value = quote($value);
+                }
+                $key_names .= $column . ', ';
+                $values .= $value . ', ';
+            }
+            $values = trim($values, ' ,');
+            $key_names = trim($key_names, ' ,');
+        }
+        return "($key_names) VALUES ($values)";
+    }
+
+
+    /**
      * helper function to create an insert statement
      * @param string $table table name to insert
      * @param array $data key value pairs column -> data
@@ -420,9 +447,10 @@ class DB {
             $ignore = "IGNORE";
         }
 
-        if (array_is_list($data)) {
-            $sql = "INSERT $ignore INTO `$table` (`" . join("`,`", array_keys($data)) . 
-            "`) VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))).")";
+        if (! array_is_list($data)) {
+            $value_sql = insert_sql($data);
+            $sql = "INSERT $ignore INTO `$table` $value_sql ";//(`" . join("`,`", array_keys($data)) . 
+            //"`) VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))).")";
         } else {
             $sql = "INSERT $ignore INTO `$table` VALUES (" . join(",", array_map('\ThreadFin\DB\quote', $data)).")";
         }
@@ -513,7 +541,6 @@ class DB {
                 if (!empty($keys)) {
                     $data = array_filter($data, bind_r('in_array', $keys), ARRAY_FILTER_USE_KEY);
                 }
-                //$sql = "$prefix (" . join(',', array_keys($data)) .  ') VALUES (';
 				$key_names = "";
 				$values = "";
                 foreach ($data as $column => $value) {
