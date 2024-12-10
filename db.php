@@ -515,24 +515,29 @@ class DB {
                 //$sql = "$prefix (" . join(',', array_keys($data)) .  ') VALUES (';
 				$key_names = "";
 				$values = "";
+                $update = "";
                 foreach ($data as $column => $value) {
 
                     if ($column[0] === '!') {
-						$key_names .= substr($column, 1);
+                        $col = substr($column, 1);
+						$key_names .= $col;
                         $values .= $value;
+                        $update .= "$col = $value, ";
                     } else {
 						$key_names .= $column;
                         $values .= quote($value);
+                        $update .= "$column = $value, ";
                     }
                     $values .= ', ';
                     $key_names .= ', ';
                 }
                 $values = trim($values, ' ,');
                 $key_names = trim($key_names, ' ,');
+                $update = trim($update, ' ,');
 				$sql = "$prefix ($key_names) VALUES ($values)";
             }
 
-            $sql .= " ON DUPLICATE KEY UPDATE $pk = LAST_INSERT_ID($pk)";
+            $sql .= " ON DUPLICATE KEY UPDATE $pk = LAST_INSERT_ID($pk), $update";
 
             $id = $t->_qb($sql, DB_FETCH_INSERT_ID);
             echo "[$sql] = $id\n";
