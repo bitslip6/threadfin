@@ -495,8 +495,15 @@ function cache_http(string $cache_dir, int $ttl, string $method, string $url, ar
     $key = md5($method . $url);
     $cache_file = $cache_dir . "/$key";
 
+    if (!file_exists($cache_dir)) {
+        mkdir($cache_dir);
+    }
+    if (!is_writable($cache_dir)) {
+        die("unable to write to [$cache_dir]\n");
+    }
+
     // get the cached file
-    if (file_exists($cache_file)) {
+    if (file_exists($cache_file) && is_readable($cache_file)) {
         if (filesize($cache_file) > 10 && filemtime($cache_file) > (time() - $ttl)) {
             $f = bzopen($cache_file, "r");
             $x = "";

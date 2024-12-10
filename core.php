@@ -1402,6 +1402,11 @@ class MaybeStr implements Maybe {
         return (!empty($this->_value)) ? $fn($this->_value) : NULL;
     }
 
+    // create a new instance of $object with $this->value as constructor
+    public function new(string $object) : mixed {
+        return (!empty($this->_value)) ? new $object($this->_value) : NULL;
+    }
+
     public function __invoke(string $type = null) { return $this->value($type); }
 }
 
