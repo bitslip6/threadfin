@@ -505,6 +505,7 @@ class DB {
         $prefix = "INSERT INTO $table ";
         return function(array $data) use ($prefix, &$t, $keys, $pk) : int {
             // set flag to ignore dupliactes
+            $update = "";
             if (array_is_list($data)) {
                 $sql = "$prefix VALUES (" . join(',', array_map('\ThreadFin\DB\quote', $data)) . ')';
             } else {
@@ -515,7 +516,6 @@ class DB {
                 //$sql = "$prefix (" . join(',', array_keys($data)) .  ') VALUES (';
 				$key_names = "";
 				$values = "";
-                $update = "";
                 foreach ($data as $column => $value) {
 
                     if ($column[0] === '!') {
@@ -525,7 +525,7 @@ class DB {
                     }
                     $key_names .= $column . ', ';
                     $values .= $value . ', ';
-                    if (!empty($value)) {
+                    if (!empty($value) && $column != $pk) {
                         $update .= "$column = $value, ";
                     }
                 }
@@ -535,10 +535,12 @@ class DB {
 				$sql = "$prefix ($key_names) VALUES ($values)";
             }
 
-            $sql .= " ON DUPLICATE KEY UPDATE $pk = LAST_INSERT_ID($pk), $update";
+            $sql .= " ON DUPLICATE KEY UPDATE $pk = LAST_INSERT_ID($pk)";
+            if (!empty($update)) {
+                $sql .= $update;
+            }
 
             $id = $t->_qb($sql, DB_FETCH_INSERT_ID);
-            echo "[$sql] = $id\n";
             return $id;
         };
     }
