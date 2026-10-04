@@ -105,6 +105,14 @@ function mysqli_query(mysqli $db, string $sql): mysqli_result|bool {
     }
     $db->queries[] = $sql;
     $db->calls[] = ['query', $sql];
+    if (isset($GLOBALS['db_fixture_query_failures'][$sql])) {
+        $db->errno = 1064;
+        $db->error = 'Syntax error (fixture)';
+        if ($GLOBALS['db_fixture_query_failures'][$sql] === 'exception') {
+            throw new mysqli_sql_exception($db->error, $db->errno);
+        }
+        return false;
+    }
     if ($sql === \ThreadFin\DB\DB_SQL_MODE_SETUP) {
         if (($GLOBALS['db_fixture_setup_failure'] ?? '') === 'mode_exception') {
             throw new mysqli_sql_exception('SQL mode setup rejected (fixture)');

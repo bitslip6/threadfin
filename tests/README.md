@@ -3,18 +3,18 @@
 These are expected-behavior TinyTest tests, not tests that expect the current bugs.
 The initial baseline was **41 failed / 0 passed / 0 incomplete / 0 skipped**.
 The SQL-injection work expanded it to **44 failed / 0 passed** before the fix.
-The current suite has **110 tests: 93 passed / 17 failed**, exit 1, with no
+The current suite has **118 tests: 103 passed / 15 failed**, exit 1, with no
 incomplete cases, skips, or runner errors. Quoting, connection failure handling,
 the dump charset-statement terminator, current-row column lookup, complete
 buffered-result array conversion, associative duplicate updates, object
 store/attribute mapping, cursor synchronization, invalid array-read rejection,
 array-backed result operations, row-offset existence bounds, the dumper's
-result map/reduce methods, dump byte budgets, and requested-database selection
-now pass. Other reviewed bugs remain unfixed.
+result map/reduce methods, dump byte budgets, requested-database selection, and
+query simulation now pass. Other reviewed bugs remain unfixed.
 
 ## Current status
 
-Verified with the default TinyTest runner: **110 total, 93 passed, 17 failed**.
+Verified with the default TinyTest runner: **118 total, 103 passed, 15 failed**.
 There are **0 incomplete tests, 0 skipped tests, and 0 runner errors**. Exit code
 1 comes from the outstanding regressions, not a runner/setup failure. Counts below
 are test functions, not assertions or separate bugs.
@@ -27,21 +27,21 @@ are test functions, not assertions or separate bugs.
 | `test_db_cursor.php` | 7 | 0 | 7 |
 | `test_db_dump.php` | 10 | 0 | 10 |
 | `test_db_duplicate_updates.php` | 4 | 0 | 4 |
-| `test_db_regressions.php` | 29 | 17 | 46 |
+| `test_db_regressions.php` | 31 | 15 | 46 |
 | `test_db_result_reads.php` | 9 | 0 | 9 |
+| `test_db_simulation.php` | 8 | 0 | 8 |
 | `test_db_store.php` | 6 | 0 | 6 |
 | `test_db_transforms.php` | 10 | 0 | 10 |
-| **Total** | **93** | **17** | **110** |
+| **Total** | **103** | **15** | **118** |
 
 ### Remaining failures
 
-All 17 failing functions are in `test_db_regressions.php`. The names below omit
+All 15 failing functions are in `test_db_regressions.php`. The names below omit
 only the common **`test_db_`** prefix. This is the current fix backlog; the broader
 coverage table below includes both fixed and outstanding regressions.
 
 | Outstanding issue | Failing test suffixes | Count |
 | --- | --- | ---: |
-| Simulation incorrectly records failures | `simulated_write_logs_without_execution_or_errors`, `simulated_read_logs_without_execution_or_errors` | 2 |
 | Null/missing template parameters | `null_template_parameter_remains_sql_null`, `missing_template_parameter_is_rejected` | 2 |
 | NULL equality instead of IS NULL | `null_where_uses_is_null` | 1 |
 | `upsert_fn()` drops zero/false updates | `upsert_can_update_integer_zero`, `upsert_can_update_boolean_false` | 2 |
@@ -50,11 +50,11 @@ coverage table below includes both fixed and outstanding regressions.
 | Replay loses DDL/rollback semantics and duplicates on close | `replay_records_successful_ddl`, `replay_does_not_commit_rolled_back_writes`, `repeated_close_does_not_duplicate_replay` | 3 |
 | Stream falsey strings, short writes, cross-stream totals | `stream_writes_literal_zero`, `stream_retries_short_writes`, `stream_byte_totals_are_per_stream` | 3 |
 | Stored SQL text replaced by result wrapper | `result_retains_original_sql_text` | 1 |
-| **Total** | | **17** |
+| **Total** | | **15** |
 
 The opt-in live-server suite is separate from these totals. Its last verification
 was **3 passed, 0 failed** on disposable MariaDB 12.3.3; it was not rerun for this
-dump budget/database fix. See the integration section below.
+query simulation fix. See the integration section below.
 
 ## Running tests
 
@@ -71,6 +71,7 @@ php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_connection.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_cursor.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_dump.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_result_reads.php
+php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_simulation.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_duplicate_updates.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_store.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_transforms.php
@@ -306,6 +307,31 @@ all ten now pass. Coverage includes header/DDL/batch boundaries, multi-table
 budgets, 301-row checkpoints, writer failures, cumulative totals, and nonempty
 requested-database selection. The two original budget/database regressions also
 pass. No live-server tests were rerun for this change.
+
+## Query simulation fixes
+
+`_qb()` and `_qr()` now return through a dedicated simulation path before query
+execution or driver metadata/error reads. Generated SQL is logged once with a
+`simulated (not executed)` marker; prior errors remain unchanged. Simulation
+continues to enable logging by default, while an explicit later
+`enable_log(false)` suppresses logs without causing execution or false errors.
+
+Status-only simulated writes return `1` for successful SQL generation. Affected-row
+and insert-ID modes return `0`: no rows were affected and no ID was generated.
+They never reuse stale driver values or manufacture a positive ID. Write
+`last_stmt` is retained. Simulated reads return an empty `SQL` wrapper that retains
+the interpolated statement and is safe to count, iterate, and convert.
+
+Unexecuted statements never enter the execution replay queue. Turning simulation
+off restores real execution, results, and false-return/exception diagnostics.
+The existing assertion-based connected-write contract is unchanged; simulation
+is not a new offline connection factory, and connection setup still runs normally.
+
+`test_db_simulation.php` adds eight cases (six failed before the fix, two already
+passed); all eight now pass. They use real public builders and execution methods,
+cover stale metadata, return modes, empty reads, logging, replay, and toggling,
+and retain disconnected-write and real-error behavior. The two original simulation
+regressions also pass. No live-server tests were rerun for this change.
 
 ## Required connection and client-escaping contract
 

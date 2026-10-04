@@ -786,6 +786,99 @@ function db_fixture_run(string $case): mixed {
             $handle->queries = []; // Observe simulation IO, not required connection setup.
             $db->fetch('SELECT name FROM records');
             return ['queries' => $handle->queries, 'logs' => $db->logs, 'errors' => $db->errors];
+        case 'simulate_return_modes':
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_simulation(true);
+            $handle->queries = [];
+            $handle->affected_rows = 42;
+            $handle->insert_id = 999;
+            $handle->errno = 1064;
+            $handle->error = 'stale driver error';
+            $db->errors[] = 'existing diagnostic';
+            $statuses = [];
+            foreach ([DB_FETCH_SUCCESS, \ThreadFin\DB\DB_FETCH_NUM_ROWS, \ThreadFin\DB\DB_FETCH_INSERT_ID] as $mode) {
+                $statuses[] = $db->unsafe_raw('INSERT INTO records VALUES (1)', $mode);
+            }
+            return ['statuses' => $statuses, 'queries' => $handle->queries, 'logs' => $db->logs,
+                'errors' => $db->errors, 'last_stmt' => $db->last_stmt];
+        case 'simulate_empty_read':
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_simulation(true);
+            $handle->queries = [];
+            $handle->errno = 1064;
+            $handle->error = 'stale driver error';
+            $sql = $db->fetch('SELECT name FROM records WHERE name = {name}', ['name' => "O'Reilly"]);
+            return ['queries' => $handle->queries, 'logs' => $db->logs, 'errors' => $db->errors,
+                'result' => [count($sql), $sql->empty(), $sql->valid(), $sql->as_array(),
+                    iterator_to_array($sql), $sql->col('name')->value()],
+                'sql' => db_fixture_property($sql, '_sql')];
+        case 'simulate_value_builders':
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_simulation(true);
+            $handle->queries = [];
+            $statuses = [
+                $db->insert('records', ['name' => 'alice']),
+                $db->store('records', (object)['name' => 'bob']),
+                ($db->insert_fn('records'))(['name' => 'carol']),
+                ($db->upsert_fn('records'))(['name' => 'dan']),
+                $db->update('records', ['name' => 'eve'], ['id' => 7]),
+                $db->delete('records', ['id' => 8]),
+            ];
+            // Explicit flush keeps this independent of the separate buffering bug.
+            $bulk = $db->bulk_fn('records', ['name' => 'name']);
+            $bulk(['name' => 'frank']);
+            $bulk();
+            return ['statuses' => $statuses, 'queries' => $handle->queries, 'logs' => $db->logs, 'errors' => $db->errors];
+        case 'simulate_replay_is_empty':
+            $path = db_fixture_file();
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_replay($path)->enable_simulation(true);
+            $handle->queries = [];
+            $db->unsafe_raw('CREATE TABLE records (id INT)');
+            $db->unsafe_raw('INSERT INTO records VALUES (1)');
+            $db->fetch('SELECT name FROM records');
+            $replay = db_fixture_property($db, '_replay');
+            $db->close();
+            return ['queries' => $handle->queries, 'logs' => $db->logs, 'errors' => $db->errors,
+                'replay' => $replay, 'file' => file_get_contents($path)];
+        case 'simulate_toggle_execution':
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_simulation(true);
+            $handle->queries = [];
+            $first = $db->unsafe_raw('INSERT INTO records VALUES (1)');
+            $db->enable_simulation(false);
+            $id = $db->unsafe_raw('INSERT INTO records VALUES (2)', \ThreadFin\DB\DB_FETCH_INSERT_ID);
+            $real = $db->fetch('SELECT name FROM records')->col('name')->value();
+            $db->enable_simulation(true);
+            $simulated = $db->fetch('SELECT name FROM records')->as_array();
+            return ['values' => [$first, $id, $real, $simulated], 'queries' => $handle->queries,
+                'logs' => $db->logs, 'errors' => $db->errors];
+        case 'simulate_logging_disabled':
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_simulation(true)->enable_log(false);
+            $handle->queries = [];
+            $status = $db->unsafe_raw('INSERT INTO records VALUES (1)');
+            $rows = $db->fetch('SELECT name FROM records')->as_array();
+            return [$status, $rows, $handle->queries, $db->logs, $db->errors];
+        case 'simulate_disconnected_write':
+            $db = DB::from(null)->enable_simulation(true);
+            try {
+                $db->unsafe_raw('INSERT INTO records VALUES (1)');
+                return false;
+            } catch (AssertionError $error) { return true; }
+        case 'simulate_disabled_real_failures':
+            $observations = [];
+            foreach (['false', 'exception'] as $failure) {
+                $handle = new mysqli();
+                $db = DB::from($handle)->enable_simulation(true)->enable_simulation(false);
+                $handle->queries = [];
+                $GLOBALS['db_fixture_query_failures'] = ['BAD WRITE' => $failure, 'SELECT bad' => $failure];
+                $status = $db->unsafe_raw('BAD WRITE');
+                $rows = $db->fetch('SELECT bad')->as_array();
+                $observations[] = [$status, $rows, $handle->queries, $db->errors, $db->logs];
+                $db->errors = []; // Avoid the unrelated close/error-log regression in this observation.
+            }
+            return $observations;
         case 'null_placeholder':
             return (new DbStatementProbe())->template('SELECT {x}', ['x' => null]);
         case 'missing_placeholder':

@@ -295,6 +295,7 @@ class DB {
      * @return DB_FETCH_SUCCESS -1 on error, 1 on success
      *  DB_FETCH_NUM_ROWS -1 on error, 0 if no rows affected, >0 if rows affected
      *  DB_FETCH_INSERT_ID -1 on error, >0 if insert id
+     *  In simulation: 1 for DB_FETCH_SUCCESS, 0 for counts/IDs (no execution).
      */
     public function unsafe_raw(string $sql, int $mode = DB_FETCH_SUCCESS) : int {
         assert(in_array($mode, [DB_FETCH_SUCCESS, DB_FETCH_NUM_ROWS, DB_FETCH_INSERT_ID], true), "invalid mode: $mode");
@@ -310,13 +311,18 @@ class DB {
         assert(!empty($this->_db), "database: {$this->database} is not connected");
 
         $this->last_stmt = "$sql\n";
+        if ($this->_simulation) {
+            if ($this->_log_enabled) {
+                $this->logs[] = "# [$sql] simulated (not executed)";
+            }
+            // No driver counts/IDs exist for a statement that was not executed.
+            return ($return_type === DB_FETCH_NUM_ROWS || $return_type === DB_FETCH_INSERT_ID) ? 0 : 1;
+        }
         $r = false;
         $affected = -1;
         $errno = 0;
         try {
-            if (!$this->_simulation) {
-                $r = mysqli_query($this->_db, $sql); 
-            }
+            $r = mysqli_query($this->_db, $sql);
         }
         // silently swallow exceptions, will catch them in next line
         catch (Exception $ex) { $r = false; }
@@ -353,12 +359,16 @@ class DB {
      */
     protected function _qr(string $sql, $mode = MYSQLI_ASSOC) : SQL {
         assert(! empty($this->_db), "database: {$this->database} is not connected");
+        if ($this->_simulation) {
+            if ($this->_log_enabled) {
+                $this->logs[] = "# [$sql] simulated (not executed)";
+            }
+            return SQL::from(null, $sql);
+        }
         $r = false;
         $errno = 0;
         try {
-            if (! $this->_simulation) {
-                $r = mysqli_query($this->_db, $sql); 
-            }
+            $r = mysqli_query($this->_db, $sql);
         }
         // silently swallow exceptions, will catch them in next line
         catch (Exception $ex) { $r = false; }
@@ -674,7 +684,7 @@ class DB {
     /**
      * store object data into table.  data must have public members and have the 
      * same names as the table
-     * @return int insert ID, or -1 when the write/ID fetch fails
+     * @return int insert ID, -1 when the write/ID fetch fails, or 0 in simulation
      */
     public function store(string $table, Object $data, int $on_duplicate = DB_DUPLICATE_IGNORE) : int {
         assert($this->_db instanceof mysqli, "database not connected");
