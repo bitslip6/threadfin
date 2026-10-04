@@ -981,6 +981,40 @@ function db_fixture_run(string $case): mixed {
             $db = new DbStatementProbe();
             ($db->upsert_fn('records'))(['flag' => $case === 'upsert_zero' ? 0 : false]);
             return $db->statements[0];
+        case 'upsert_all_values':
+            $db = new DbStatementProbe();
+            $id = ($db->upsert_fn('records'))(['id' => 0, 'zero' => 0, 'float_zero' => 0.0, 'flag' => false,
+                'blank' => '', 'nil' => null, 'code' => '00123', 'text' => "O'Reilly"]);
+            return ['id' => $id, 'sql' => $db->statements[0]];
+        case 'upsert_allowed_keys':
+            $db = new DbStatementProbe();
+            ($db->upsert_fn('records', ['id', 'zero', 'flag']))(['id' => 0, 'zero' => 0, 'flag' => false, 'hidden' => 'omit']);
+            return $db->statements[0];
+        case 'upsert_custom_pk_and_raw_zero':
+            $db = new DbStatementProbe();
+            ($db->upsert_fn('records', null, 'record_key'))(['!record_key' => '0', '!raw_zero' => '0',
+                '!changed_at' => 'NOW()', 'flag' => false]);
+            return $db->statements[0];
+        case 'upsert_repeated_calls':
+            $db = new DbStatementProbe();
+            $upsert = $db->upsert_fn('records');
+            $ids = [$upsert(['zero' => 0]), $upsert(['flag' => false])];
+            return [$db->statements, $ids];
+        case 'upsert_pk_only_and_list':
+            $db = new DbStatementProbe();
+            $upsert = $db->upsert_fn('records');
+            $upsert(['id' => 0]);
+            $upsert([0, false]);
+            return $db->statements;
+        case 'upsert_public_execution':
+            $handle = new mysqli();
+            $db = DB::from($handle);
+            $handle->queries = [];
+            $upsert = $db->upsert_fn('records');
+            $id = $upsert(['flag' => 0]);
+            $db->enable_simulation(true);
+            $simulated = $upsert(['flag' => false]);
+            return ['ids' => [$id, $simulated], 'queries' => $handle->queries, 'logs' => $db->logs, 'errors' => $db->errors];
         case 'bulk_batch':
             $db = new DbStatementProbe();
             $insert = $db->bulk_fn('records', ['name' => 'name']);

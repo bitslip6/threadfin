@@ -596,7 +596,8 @@ class DB {
                     }
                     $key_names .= $column . ', ';
                     $values .= $value . ', ';
-                    if (!empty($value) && $column != $pk) {
+                    // Every supplied non-PK value is an update, including SQL zero.
+                    if ($column != $pk) {
                         $update .= "$column = $value, ";
                     }
                 }

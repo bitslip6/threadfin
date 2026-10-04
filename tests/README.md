@@ -3,19 +3,19 @@
 These are expected-behavior TinyTest tests, not tests that expect the current bugs.
 The initial baseline was **41 failed / 0 passed / 0 incomplete / 0 skipped**.
 The SQL-injection work expanded it to **44 failed / 0 passed** before the fix.
-The current suite has **131 tests: 119 passed / 12 failed**, exit 1, with no
+The current suite has **137 tests: 127 passed / 10 failed**, exit 1, with no
 incomplete cases, skips, or runner errors. Quoting, connection failure handling,
 the dump charset-statement terminator, current-row column lookup, complete
 buffered-result array conversion, associative duplicate updates, object
 store/attribute mapping, cursor synchronization, invalid array-read rejection,
 array-backed result operations, row-offset existence bounds, the dumper's
 result map/reduce methods, dump byte budgets, requested-database selection,
-query simulation, null/missing template-parameter handling, and NULL predicates
-now pass. Other reviewed bugs remain unfixed.
+query simulation, null/missing template-parameter handling, NULL predicates, and
+falsey `upsert_fn()` updates now pass. Other reviewed bugs remain unfixed.
 
 ## Current status
 
-Verified with the default TinyTest runner: **131 total, 119 passed, 12 failed**.
+Verified with the default TinyTest runner: **137 total, 127 passed, 10 failed**.
 There are **0 incomplete tests, 0 skipped tests, and 0 runner errors**. Exit code
 1 comes from the outstanding regressions, not a runner/setup failure. Counts below
 are test functions, not assertions or separate bugs.
@@ -28,34 +28,34 @@ are test functions, not assertions or separate bugs.
 | `test_db_cursor.php` | 7 | 0 | 7 |
 | `test_db_dump.php` | 10 | 0 | 10 |
 | `test_db_duplicate_updates.php` | 4 | 0 | 4 |
-| `test_db_regressions.php` | 34 | 12 | 46 |
+| `test_db_regressions.php` | 36 | 10 | 46 |
 | `test_db_result_reads.php` | 9 | 0 | 9 |
 | `test_db_simulation.php` | 8 | 0 | 8 |
 | `test_db_store.php` | 6 | 0 | 6 |
 | `test_db_templates.php` | 8 | 0 | 8 |
 | `test_db_transforms.php` | 10 | 0 | 10 |
+| `test_db_upsert.php` | 6 | 0 | 6 |
 | `test_db_where.php` | 5 | 0 | 5 |
-| **Total** | **119** | **12** | **131** |
+| **Total** | **127** | **10** | **137** |
 
 ### Remaining failures
 
-All 12 failing functions are in `test_db_regressions.php`. The names below omit
+All 10 failing functions are in `test_db_regressions.php`. The names below omit
 only the common **`test_db_`** prefix. This is the current fix backlog; the broader
 coverage table below includes both fixed and outstanding regressions.
 
 | Outstanding issue | Failing test suffixes | Count |
 | --- | --- | ---: |
-| `upsert_fn()` drops zero/false updates | `upsert_can_update_integer_zero`, `upsert_can_update_boolean_false` | 2 |
 | Bulk inserts flush immediately/use numeric column names | `bulk_insert_buffers_until_flush_or_limit`, `bulk_insert_accepts_list_column_names` | 2 |
 | Non-duplicate SQL errors discarded | `close_logs_non_duplicate_sql_errors` | 1 |
 | Replay loses DDL/rollback semantics and duplicates on close | `replay_records_successful_ddl`, `replay_does_not_commit_rolled_back_writes`, `repeated_close_does_not_duplicate_replay` | 3 |
 | Stream falsey strings, short writes, cross-stream totals | `stream_writes_literal_zero`, `stream_retries_short_writes`, `stream_byte_totals_are_per_stream` | 3 |
 | Stored SQL text replaced by result wrapper | `result_retains_original_sql_text` | 1 |
-| **Total** | | **12** |
+| **Total** | | **10** |
 
 The opt-in live-server suite is separate from these totals. Its last verification
 was **3 passed, 0 failed** on disposable MariaDB 12.3.3; it was not rerun for this
-NULL-predicate fix. See the integration section below.
+falsey `upsert_fn()` fix. See the integration section below.
 
 ## Running tests
 
@@ -77,6 +77,7 @@ php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_duplicate_updates.
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_store.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_templates.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_transforms.php
+php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_upsert.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_where.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_regressions.php \
   -t test_db_col_reads_current_associative_row
@@ -176,8 +177,8 @@ policy. All values use the shared quoting policy, including falsey values.
 
 The two original upsert regressions pass, as do four additional tests in
 `test_db_duplicate_updates.php` (all four failed before this fix). Attribute
-extraction in `store()` is now also fixed; the distinct `upsert_fn()` zero/false
-bug remains a separate pending issue.
+extraction in `store()` is now also fixed. The distinct `upsert_fn()` zero/false
+bug is now fixed as described below.
 
 ## Object store and attribute fixes
 
@@ -377,6 +378,22 @@ passed); all five now pass. They cover mixed/multiple nulls, falsey/text/raw
 values, and generated public write statements against the mysqli boundary. The
 original NULL-predicate regression also passes. No live-server tests were rerun
 for this change.
+
+## Falsey upsert-function updates fix
+
+`upsert_fn()` no longer truthiness-filters rendered update values. SQL zero was
+considered empty by PHP, dropping integer zero, floating zero, false, and trusted
+raw `'0'` expressions from the duplicate-update clause. Every supplied non-primary-
+key value now reaches the update clause. Quoting, allowed-key filtering, primary-
+key normalization/protection, and `LAST_INSERT_ID(pk)` behavior remain unchanged.
+Empty text, null, numeric-looking strings, and ordinary text retain their existing
+insert/update semantics. Non-null `!` values remain caller-trusted raw SQL.
+
+`test_db_upsert.php` adds six cases (five failed before the fix, one already passed);
+all six now pass. They cover mixed values, allowed keys, custom/raw-prefixed primary
+keys, raw zero, repeated closure calls, PK-only/positional compatibility, and real
+execution/simulation paths against the mysqli boundary. The two original zero/false
+regressions also pass. No live-server tests were rerun for this change.
 
 ## Required connection and client-escaping contract
 
