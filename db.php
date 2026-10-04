@@ -806,8 +806,22 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
     }
 
     public function offsetGet(mixed $offset): array {
-        $this->_mysqli_result->data_seek($offset);
-        return $this->_mysqli_result->fetch_assoc();
+        if ($offset < 0 || $offset >= $this->_len || !$this->_mysqli_result->data_seek($offset)) {
+            throw new OutOfBoundsException("row offset [$offset] is out of bounds");
+        }
+        try {
+            return $this->_mysqli_result->fetch_assoc();
+        } finally {
+            // Random reads must not change the iterator's next-fetch position.
+            $resume = $this->_position + 1;
+            if ($resume < $this->_len) {
+                $this->_mysqli_result->data_seek($resume);
+            } else {
+                // mysqli cannot seek directly to EOF; consume the last row instead.
+                $this->_mysqli_result->data_seek($this->_len - 1);
+                $this->_mysqli_result->fetch_assoc();
+            }
+        }
     }
 
     public function offsetSet(mixed $offset, mixed $value): void {
@@ -847,9 +861,11 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
      * set internal dataset to row  at current row index 
      */
     public function seek(int $offset = 0) : void {
-        if (!$this->_mysqli_result->data_seek($offset)) {
-            $this->_errors[] = "seek to [$offset] failed";
+        if ($offset < 0 || $offset >= $this->_len || !$this->_mysqli_result->data_seek($offset)) {
+            throw new OutOfBoundsException("row offset [$offset] is out of bounds");
         }
+        $this->_x = $this->_mysqli_result->fetch_assoc();
+        $this->_position = $offset;
     }
 
     public function current() : array {
