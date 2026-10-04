@@ -973,32 +973,17 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
         return $this;
     }
 
-    /**
-     * map $fn on each row in entire result (works on raw result, no set necessary)
-     *
+    */
+
+    /** Map every buffered row without changing the iterator's position. */
     public function map(callable $fn) : array {
-        if (is_array($this->_x) && !empty($this->_x)) {
-            return array_map($fn, $this->_x);
-        } else {
-            $this->_errors[] = "wont call " . func_name($fn) . " on data : " . var_export($this->_data, true);
-        }
-        return [];
+        return array_map($fn, $this->as_array());
     }
 
-    /**
-     * reduce $fn($carry, $item) on each row in entire result (works on raw result, no set necessary)
-     * $fn may return any type, but should be a string in 99% cases
-     * @return mixed return type of $fn, false if rows (_x) is empty
-     *
+    /** Fold every buffered row; empty results return the initial value unchanged. */
     public function reduce(callable $fn, $initial = "") : mixed {
-        if (is_array($this->_x) && !empty($this->_x)) {
-            return array_reduce($this->_x, $fn, $initial);
-        } else {
-            $this->_errors[] = "wont call " . func_name($fn) . " on data : " . var_export($this->_data, true);
-        }
-        return false;
+        return array_reduce($this->as_array(), $fn, $initial);
     }
-    */
 
     /*
     // run an a function that has external effect on current data
