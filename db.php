@@ -399,8 +399,9 @@ class DB {
      * 
      * @see SQL
      * @param string $sql - SELECT QUERY FROM your_table WHERE id = {id} 
-     * @param array|object $data - data to replace {params} with, key/values
+     * @param null|array|object $data - named values or initialized readable object fields
      * @return SQL - SQL result abstraction
+     * @throws \InvalidArgumentException for unsupported containers or missing template parameters
      */
     public function fetch(string $sql, $data = NULL, $mode = MYSQLI_ASSOC) : SQL {
         $new_sql = $this->fetch_to_statement($sql, $data, $mode);
@@ -418,33 +419,22 @@ class DB {
      * @return string 
      */
     protected function fetch_to_statement(string $sql, $data = NULL, $mode = MYSQLI_ASSOC) : string {
-        // programming errors
-        //assert(!is_null($data) && !is_array($data) && !is_object($data), "$data must be null, array or object");
-        assert(is_null($data) || is_object($data) || (is_array($data) && count(array_filter(array_keys($data), 'is_string')) > 0), print_r($data, true) . " requires an associative array");
-
-        $type = (is_array($data)) ? 'array' : ((is_object($data)) ? 'object' : 'scalar');
-        // replace {} with named values from $data, or $this->_x
-        $new_sql = preg_replace_callback("/{!?\w+}/", function ($x) use ($data, $type) {
-            // strip off the template brackets
-            $param = str_replace(array('{', '}'), '', $x[0]);
-            $quote_fn = '\ThreadFin\DB\quote';
-            // if the parameter should not be quoted, strip off the ! and use id for quote function
-            if ($param[0] == "!") {
-                $param = substr($param, 1);
-                $quote_fn = '\ThreadFin\core\ident';
+        if ($data !== null && !is_array($data) && !is_object($data)) {
+            throw new \InvalidArgumentException('SQL template parameters must be an array, object, or null');
+        }
+        // get_object_vars omits inaccessible and uninitialized fields, but retains nulls.
+        $parameters = is_object($data) ? get_object_vars($data) : ($data ?? []);
+        return preg_replace_callback("/{!?\w+}/", function ($match) use ($parameters) {
+            $param = substr($match[0], 1, -1);
+            $raw = $param[0] === '!';
+            if ($raw) { $param = substr($param, 1); }
+            if (!array_key_exists($param, $parameters)) {
+                throw new \InvalidArgumentException("Missing SQL template parameter [$param]");
             }
-            // default to the scalar value 
-            $data_param = $param;
-            if ($type === "array") {
-                $data_param = $data[$param]??"NO_SUCH_KEY_$param";
-            } else if ($type === "object") {
-                $data_param = $data->$param;
-            }
-            $result = (string)$quote_fn($data_param);
-            return $result;
+            $value = $parameters[$param];
+            // ! expressions remain trusted raw SQL; explicit null is always SQL NULL.
+            return ($raw && $value !== null) ? (string)$value : quote($value);
         }, $sql);
-
-        return $new_sql;
     }
 
 

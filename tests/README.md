@@ -3,18 +3,19 @@
 These are expected-behavior TinyTest tests, not tests that expect the current bugs.
 The initial baseline was **41 failed / 0 passed / 0 incomplete / 0 skipped**.
 The SQL-injection work expanded it to **44 failed / 0 passed** before the fix.
-The current suite has **118 tests: 103 passed / 15 failed**, exit 1, with no
+The current suite has **126 tests: 113 passed / 13 failed**, exit 1, with no
 incomplete cases, skips, or runner errors. Quoting, connection failure handling,
 the dump charset-statement terminator, current-row column lookup, complete
 buffered-result array conversion, associative duplicate updates, object
 store/attribute mapping, cursor synchronization, invalid array-read rejection,
 array-backed result operations, row-offset existence bounds, the dumper's
-result map/reduce methods, dump byte budgets, requested-database selection, and
-query simulation now pass. Other reviewed bugs remain unfixed.
+result map/reduce methods, dump byte budgets, requested-database selection,
+query simulation, and null/missing template-parameter handling now pass. Other
+reviewed bugs remain unfixed.
 
 ## Current status
 
-Verified with the default TinyTest runner: **118 total, 103 passed, 15 failed**.
+Verified with the default TinyTest runner: **126 total, 113 passed, 13 failed**.
 There are **0 incomplete tests, 0 skipped tests, and 0 runner errors**. Exit code
 1 comes from the outstanding regressions, not a runner/setup failure. Counts below
 are test functions, not assertions or separate bugs.
@@ -27,22 +28,22 @@ are test functions, not assertions or separate bugs.
 | `test_db_cursor.php` | 7 | 0 | 7 |
 | `test_db_dump.php` | 10 | 0 | 10 |
 | `test_db_duplicate_updates.php` | 4 | 0 | 4 |
-| `test_db_regressions.php` | 31 | 15 | 46 |
+| `test_db_regressions.php` | 33 | 13 | 46 |
 | `test_db_result_reads.php` | 9 | 0 | 9 |
 | `test_db_simulation.php` | 8 | 0 | 8 |
 | `test_db_store.php` | 6 | 0 | 6 |
+| `test_db_templates.php` | 8 | 0 | 8 |
 | `test_db_transforms.php` | 10 | 0 | 10 |
-| **Total** | **103** | **15** | **118** |
+| **Total** | **113** | **13** | **126** |
 
 ### Remaining failures
 
-All 15 failing functions are in `test_db_regressions.php`. The names below omit
+All 13 failing functions are in `test_db_regressions.php`. The names below omit
 only the common **`test_db_`** prefix. This is the current fix backlog; the broader
 coverage table below includes both fixed and outstanding regressions.
 
 | Outstanding issue | Failing test suffixes | Count |
 | --- | --- | ---: |
-| Null/missing template parameters | `null_template_parameter_remains_sql_null`, `missing_template_parameter_is_rejected` | 2 |
 | NULL equality instead of IS NULL | `null_where_uses_is_null` | 1 |
 | `upsert_fn()` drops zero/false updates | `upsert_can_update_integer_zero`, `upsert_can_update_boolean_false` | 2 |
 | Bulk inserts flush immediately/use numeric column names | `bulk_insert_buffers_until_flush_or_limit`, `bulk_insert_accepts_list_column_names` | 2 |
@@ -50,11 +51,11 @@ coverage table below includes both fixed and outstanding regressions.
 | Replay loses DDL/rollback semantics and duplicates on close | `replay_records_successful_ddl`, `replay_does_not_commit_rolled_back_writes`, `repeated_close_does_not_duplicate_replay` | 3 |
 | Stream falsey strings, short writes, cross-stream totals | `stream_writes_literal_zero`, `stream_retries_short_writes`, `stream_byte_totals_are_per_stream` | 3 |
 | Stored SQL text replaced by result wrapper | `result_retains_original_sql_text` | 1 |
-| **Total** | | **15** |
+| **Total** | | **13** |
 
 The opt-in live-server suite is separate from these totals. Its last verification
 was **3 passed, 0 failed** on disposable MariaDB 12.3.3; it was not rerun for this
-query simulation fix. See the integration section below.
+template-parameter fix. See the integration section below.
 
 ## Running tests
 
@@ -74,6 +75,7 @@ php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_result_reads.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_simulation.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_duplicate_updates.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_store.php
+php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_templates.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_transforms.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_regressions.php \
   -t test_db_col_reads_current_associative_row
@@ -332,6 +334,29 @@ passed); all eight now pass. They use real public builders and execution methods
 cover stale metadata, return modes, empty reads, logging, replay, and toggling,
 and retain disconnected-write and real-error behavior. The two original simulation
 regressions also pass. No live-server tests were rerun for this change.
+
+## Template-parameter fixes
+
+`fetch_to_statement()` now uses key-existence checks instead of null-coalescing
+fallback data. Present null values become SQL `null`, including repeated and raw
+`!` placeholders. Zero, false, empty text, numeric-looking strings, and ordinary
+quoted text retain the shared quoting policy. Non-null `!` values remain trusted
+raw SQL expressions, not safe dynamic identifiers or untrusted-input APIs.
+
+Parameter containers must be arrays, objects, or null; other types raise
+`InvalidArgumentException`. Objects supply their initialized readable fields via
+`get_object_vars()`, preserving explicit null while omitting inaccessible or
+uninitialized fields. This is a field-bag API, not magic-property resolution.
+A referenced missing field/key raises `InvalidArgumentException` identifying the
+parameter instead of producing `NO_SUCH_KEY` or parameter-name literals. Empty
+containers/no data are accepted for SQL without placeholders, but cannot supply
+referenced values. The template regex remains unchanged; this is not a SQL lexer.
+
+Missing parameters are rejected before driver execution or simulation logging,
+without manufacturing database errors or sending partially substituted SQL.
+`test_db_templates.php` adds eight cases (seven failed before the fix, one already
+passed); all eight now pass. The two original null/missing regressions also pass.
+No live-server tests were rerun for this change.
 
 ## Required connection and client-escaping contract
 

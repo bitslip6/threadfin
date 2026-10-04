@@ -38,7 +38,7 @@ class DbStatementProbe extends DB {
     public function insertStatement(array $data, int $mode, ?array $noUpdate = null, ?array $ifNull = null): string {
         return $this->insert_stmt('records', $data, $mode, $noUpdate, $ifNull);
     }
-    public function template(string $sql, array $data): string {
+    public function template(string $sql, mixed $data = null): string {
         return $this->fetch_to_statement($sql, $data);
     }
 }
@@ -888,6 +888,75 @@ function db_fixture_run(string $case): mixed {
             } catch (InvalidArgumentException|OutOfBoundsException $error) {
                 return true;
             }
+        case 'template_values':
+            $values = ['nil' => null, 'zero' => 0, 'flag' => false, 'blank' => '', 'code' => '00123', 'text' => "O'Reilly"];
+            $probe = new DbStatementProbe();
+            $sql = 'SELECT {nil}, {zero}, {flag}, {blank}, {code}, {text}, {nil}';
+            return [$probe->template($sql, $values), $probe->template($sql, (object)$values)];
+        case 'template_missing_values':
+            $observations = [];
+            foreach ([
+                ['SELECT {x}', ['other' => 1], 'x'],
+                ['SELECT {x}', [], 'x'],
+                ['SELECT {x}', null, 'x'],
+                ['SELECT {x}', (object)['other' => 1], 'x'],
+                ['SELECT {x}', new stdClass(), 'x'],
+                ['SELECT {!x}', ['other' => 1], 'x'],
+                ['SELECT {!x}', new stdClass(), 'x'],
+                ['SELECT {uninitialized}', new DbPublicInstanceRecord(), 'uninitialized'],
+                ['SELECT {secret}', new DbPublicInstanceRecord(), 'secret'],
+            ] as [$sql, $values, $name]) {
+                try {
+                    (new DbStatementProbe())->template($sql, $values);
+                    $observations[] = [false, false];
+                } catch (Throwable $error) {
+                    $observations[] = [$error instanceof InvalidArgumentException || $error instanceof OutOfBoundsException,
+                        str_contains($error->getMessage(), $name)];
+                }
+            }
+            return $observations;
+        case 'template_public_fields':
+            return (new DbStatementProbe())->template('SELECT {name}, {nil}', new DbPublicInstanceRecord());
+        case 'template_raw_values':
+            $values = ['expr' => 'COUNT(*)', 'nil' => null];
+            $sql = 'SELECT {!expr}, {!nil}, {expr}';
+            $probe = new DbStatementProbe();
+            return [$probe->template($sql, $values), $probe->template($sql, (object)$values)];
+        case 'template_no_placeholders':
+            $probe = new DbStatementProbe();
+            return [$probe->template('SELECT 1'), $probe->template('SELECT 1', []),
+                $probe->template('SELECT 1', new stdClass()), $probe->template('SELECT 1', ['unused' => null])];
+        case 'template_invalid_input':
+            $observations = [];
+            foreach ([1, false, 'text'] as $values) {
+                try {
+                    (new DbStatementProbe())->template('SELECT {x}', $values);
+                    $observations[] = false;
+                } catch (Throwable $error) { $observations[] = $error instanceof InvalidArgumentException; }
+            }
+            return $observations;
+        case 'template_public_missing_is_not_executed':
+            $observations = [];
+            foreach ([false, true] as $simulate) {
+                $handle = new mysqli();
+                $db = DB::from($handle)->enable_log(true);
+                if ($simulate) { $db->enable_simulation(true); }
+                $handle->queries = [];
+                $db->last_stmt = 'unchanged';
+                try {
+                    $db->fetch('SELECT {good}, {missing}', ['good' => null]);
+                    $rejected = false;
+                } catch (InvalidArgumentException|OutOfBoundsException $error) { $rejected = true; }
+                $observations[] = [$rejected, $handle->queries, $db->logs, $db->errors, $db->last_stmt];
+                $db->errors = []; // Do not involve the separate error-log-on-close regression.
+            }
+            return $observations;
+        case 'template_public_values':
+            $handle = new mysqli();
+            $db = DB::from($handle);
+            $handle->queries = [];
+            $rows = $db->fetch('SELECT {nil}, {code}', ['nil' => null, 'code' => '00123'])->as_array();
+            return [$handle->queries, $rows, $db->errors];
         case 'null_where':
             return where_clause(['name' => null]);
         case 'upsert_zero':
