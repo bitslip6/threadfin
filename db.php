@@ -1097,11 +1097,11 @@ function stream_output_fn(?string $data, $stream, $fn = "fwrite") : int {
 
 
 /**
- * dump a single SQL table 100 rows at a time
- * @param DB $db 
- * @param string $db_dump_file 
- * @param mixed $row 
- * @return int number of uncompressed bytes written
+ * dump a single SQL table 300 rows at a time
+ * @param DB $db
+ * @param callable $write_fn writer returning a negative value on failure
+ * @param array $row SHOW TABLES row
+ * @return Offset checkpoint after the last fully written row batch
  */
 function dump_table(DB $db, callable $write_fn, array $row) : ?Offset {
     $idx = 0;
@@ -1114,12 +1114,12 @@ function dump_table(DB $db, callable $write_fn, array $row) : ?Offset {
     $num_rows = intval($db->fetch("SELECT count(*) as count FROM $table")->col("count")());
     // the create statement
     $create = $db->fetch("SHOW CREATE TABLE $table");
-    // table header line
-    $write_fn("# Export of $table\n# $num_rows rows in $table\n");
-    // drop table if it exists
-    $write_fn("DROP TABLE IF EXISTS `$table`;\n");
-    // add create statement
-    $write_fn($create->col("Create Table")() . ";\n\n");
+    // Stop immediately if a header/DDL chunk cannot be written.
+    if ($write_fn("# Export of $table\n# $num_rows rows in $table\n") < 0
+        || $write_fn("DROP TABLE IF EXISTS `$table`;\n") < 0
+        || $write_fn($create->col("Create Table")() . ";\n\n") < 0) {
+        return $offset;
+    }
 
     // insert $limit rows at a time
     while($idx < $num_rows) {
@@ -1131,7 +1131,7 @@ function dump_table(DB $db, callable $write_fn, array $row) : ?Offset {
         }, "INSERT IGNORE INTO $table VALUES");
         // write to the output stream
         $bytes_written = $write_fn(substr($result, 0, -2) . ";\n\n");
-        if ($bytes_written < 0 || $bytes_written > 1048576*20) {
+        if ($bytes_written < 0) {
             return $offset;
         }
 
@@ -1153,19 +1153,45 @@ function dump_table(DB $db, callable $write_fn, array $row) : ?Offset {
  * @param string $db_name the name of the database (eg, wordpress)
  * @param callable $write_fn a function that takes a string and 
  *      writes it to the output stream (fwrite, gzwrite, etc)
+ * @param int $max_bytes maximum uncompressed bytes, including headers (nonnegative)
  * @return array of Offset objects. one for each table in $db_name
  */
 function dump_database(Credentials $cred, string $db_name, callable $write_fn, int $max_bytes = 1024*1024*50) : array {
+    if ($max_bytes < 0) {
+        throw new \InvalidArgumentException('dump byte budget must be nonnegative');
+    }
     $header = "# Database export of ($db_name) began at UTC: " 
             . date(DATE_RFC3339) . "\n# UTC tv: " . utc_time() . "\n\n";
     // Restore the same charset/mode required by PHP-side quoted dump values.
     $init_sql = "SET NAMES 'utf8mb4';\n" . DB_SQL_MODE_SETUP . ";\n";
 
-    $db = DB::cred_connect($cred); // Connection setup already applied both settings.
+    // Select the requested database without mutating the supplied credentials.
+    $db = DB::connect($cred->host, $cred->username, $cred->password, $db_name);
     $tables = $db->fetch("SHOW TABLES");
-    $write_fn($header . $init_sql);
+    $remaining = $max_bytes;
+    $stopped = false;
+    $bounded_write = function(string $chunk) use ($write_fn, &$remaining, &$stopped): int {
+        $bytes = strlen($chunk);
+        // Keep chunks whole so a budget stop cannot emit truncated SQL.
+        if ($stopped || $bytes > $remaining) {
+            $stopped = true;
+            return -1;
+        }
+        if ($write_fn($chunk) < 0) {
+            $stopped = true;
+            return -1;
+        }
+        // Writers may return cumulative totals; account for input bytes instead.
+        $remaining -= $bytes;
+        return $bytes;
+    };
+    $bounded_write($header . $init_sql);
 
-    $t = bind_l('\ThreadFin\DB\dump_table', $db, $write_fn);
-    $data = $tables->map($t);
-    return (!$data || empty($data) || !is_array($data)) ? [] : $data;
+    return $tables->map(function(array $row) use ($db, $bounded_write, &$remaining, &$stopped): Offset {
+        if ($stopped || $remaining === 0) {
+            // Preserve an incomplete checkpoint for every unvisited table.
+            return new Offset($row["Tables_in_{$db->database}"]);
+        }
+        return dump_table($db, $bounded_write, $row);
+    });
 }
