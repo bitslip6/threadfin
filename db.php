@@ -771,8 +771,13 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
     protected $_len;
     protected $_fetch_all;
     protected $_mysqli_result;
+    // Array-backed datasets are separate from the iterator's current row (_x).
+    protected ?array $_rows = null;
 
     public function count(): int {
+        if ($this->_rows !== null) {
+            return count($this->_rows);
+        }
         if (empty($this->_mysqli_result)) {
             return 0;
         }
@@ -785,6 +790,9 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
 
     /** Return all buffered rows without disturbing the iterator's current row. */
     public function as_array(): array {
+        if ($this->_rows !== null) {
+            return $this->_rows;
+        }
         if (!$this->_mysqli_result || $this->_mysqli_result->num_rows === 0) {
             return [];
         }
@@ -806,7 +814,13 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
     }
 
     public function offsetGet(mixed $offset): array {
-        if ($offset < 0 || $offset >= $this->_len || !$this->_mysqli_result->data_seek($offset)) {
+        if ($offset < 0 || $offset >= $this->_len) {
+            throw new OutOfBoundsException("row offset [$offset] is out of bounds");
+        }
+        if ($this->_rows !== null) {
+            return $this->_rows[$offset];
+        }
+        if (!$this->_mysqli_result || !$this->_mysqli_result->data_seek($offset)) {
             throw new OutOfBoundsException("row offset [$offset] is out of bounds");
         }
         try {
@@ -833,15 +847,16 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
     }
 
     /**
-     * create a new SQL result abstraction from a SQL associative result
-     * @param null|array $x 
-     * @param string $sql the sql that generated the result
+     * create a new SQL result abstraction from an array of associative rows
+     * @param null|array $x rows in iteration order, normalized to zero-based offsets
+     * @param string $in_sql the sql that generated the result
      * @return SQL 
      */
     public static function from(?array $x, string $in_sql="", bool $fetch_all = true) : SQL { 
         $sql = new SQL();
-        $sql->_x = $x;
-        $sql->_len < (is_array($x)) ? count($x) : 0;
+        $sql->_rows = array_values($x ?? []);
+        $sql->_len = count($sql->_rows);
+        $sql->_x = $sql->_rows[0] ?? null;
         $sql->_sql = $in_sql;
         $sql->_fetch_all = $fetch_all;
         return $sql; 
@@ -861,10 +876,17 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
      * set internal dataset to row  at current row index 
      */
     public function seek(int $offset = 0) : void {
-        if ($offset < 0 || $offset >= $this->_len || !$this->_mysqli_result->data_seek($offset)) {
+        if ($offset < 0 || $offset >= $this->_len) {
             throw new OutOfBoundsException("row offset [$offset] is out of bounds");
         }
-        $this->_x = $this->_mysqli_result->fetch_assoc();
+        if ($this->_rows !== null) {
+            $this->_x = $this->_rows[$offset];
+        } else {
+            if (!$this->_mysqli_result || !$this->_mysqli_result->data_seek($offset)) {
+                throw new OutOfBoundsException("row offset [$offset] is out of bounds");
+            }
+            $this->_x = $this->_mysqli_result->fetch_assoc();
+        }
         $this->_position = $offset;
     }
 
@@ -878,14 +900,18 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
 
     public function next() : void {
         $this->_position++;
-        if ($this->_mysqli_result) {
+        if ($this->_rows !== null) {
+            $this->_x = $this->_rows[$this->_position] ?? null;
+        } else if ($this->_mysqli_result) {
             $this->_x = $this->_mysqli_result->fetch_assoc();
         }
     }
 
     public function rewind() : void {
         $this->_position = 0;
-        if ($this->_mysqli_result) {
+        if ($this->_rows !== null) {
+            $this->_x = $this->_rows[0] ?? null;
+        } else if ($this->_mysqli_result) {
             $this->_mysqli_result->data_seek(0);
             $this->_x = $this->_mysqli_result->fetch_assoc();
         }
