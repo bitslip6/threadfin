@@ -129,7 +129,7 @@ function quote_utf8(string $input) : string {
 }
 
 /**
- * create a where clause from an array of key value pairs
+ * create a where clause from an array of key value pairs; PHP null uses IS NULL
  * @param array $data 
  * @return string - the generated SQL where clause
  */
@@ -141,9 +141,9 @@ function where_clause(array $data) : string {
         if (strlen($result) > 7) { $result .= " AND "; }
         if (is_string($key) && $key[0] === '!') {
             $t = substr($key, 1);
-            $result .= " `{$t}` = {$value} ";
+            $result .= ($value === null) ? " `{$t}` IS NULL " : " `{$t}` = {$value} ";
         } else {
-            $result .= " `{$key}` = " . quote($value);
+            $result .= " `{$key}`" . (($value === null) ? " IS NULL" : " = " . quote($value));
         }
     }
     $x = trim($result, ",");

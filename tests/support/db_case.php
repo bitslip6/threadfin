@@ -959,6 +959,23 @@ function db_fixture_run(string $case): mixed {
             return [$handle->queries, $rows, $db->errors];
         case 'null_where':
             return where_clause(['name' => null]);
+        case 'where_multiple_nulls':
+            return where_clause(['first' => null, 'second' => null, 'third' => null]);
+        case 'where_mixed_values':
+            return where_clause(['missing' => null, 'zero' => 0, 'flag' => false, 'blank' => '',
+                'code' => '00123', 'text' => "O'Reilly", 'literal' => 'NULL', 'other' => null]);
+        case 'where_raw_values':
+            return where_clause(['!nil' => null, '!clock' => 'NOW()', '!text_null' => 'NULL', 'plain' => null]);
+        case 'where_non_null_values':
+            return where_clause(['zero' => 0, 'flag' => false, 'blank' => '', 'code' => '00123',
+                'literal' => 'NULL', '!clock' => 'NOW()']);
+        case 'where_public_writes':
+            $handle = new mysqli();
+            $db = DB::from($handle);
+            $handle->queries = [];
+            $statuses = [$db->delete('records', ['deleted_at' => null, 'name' => 'NULL']),
+                $db->update('records', ['name' => null], ['deleted_at' => null, 'id' => 0])];
+            return ['statuses' => $statuses, 'queries' => $handle->queries, 'errors' => $db->errors];
         case 'upsert_zero':
         case 'upsert_false':
             $db = new DbStatementProbe();
