@@ -28,6 +28,9 @@ const DB_DUPLICATE_ERROR = 16;
 const DB_DUPLICATE_UPDATE = 32;
 const DB_MAX_BULK_INSERT = 64;
 
+// Preserve strict/ANSI/other modes while enabling backslash string escapes.
+const DB_SQL_MODE_SETUP = "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','))";
+
 
 /**
  * The property is a primary key and will not update on duplicate
@@ -99,19 +102,30 @@ function glue(array $data, string $join = " = ", string $append_str = ", ") : st
 }
 
 /**
- * add SQL quoting to a string, convert ints and bool to SQL types
- * @param mixed $input 
- * @return string 
+ * Quote UTF-8 text entirely in PHP for the session configured by DB::from/connect:
+ * utf8mb4 with NO_BACKSLASH_ESCAPES disabled. Do not change that session mode or
+ * charset after setup. Raw SQL/identifiers supplied through ! remain trusted APIs.
  */
 function quote($input) : string {
     if (is_null($input)) { return 'null'; }
+    // Strings (including numeric-looking ones) must retain their string type.
+    if (is_string($input)) { return quote_utf8($input); }
     if (is_numeric($input)) { return strval($input); }
-    if (is_string($input)) { return "'".addslashes($input)."'"; }
     if (is_bool($input)) { return $input ? '1' : '0'; }
     if (is_array($input)) { return implode(',', array_map('\ThreadFin\DB\quote', $input)); }
     $x = (string)$input;
     debug("implicit quote cast to string: [%s]", $x);
-    return "'".addslashes($x)."'";
+    return quote_utf8($x);
+}
+
+/** Escape one UTF-8 string for a backslash-enabled MySQL session, without IO. */
+function quote_utf8(string $input) : string {
+    // strtr's array form replaces original bytes once, never re-escaping output.
+    return "'" . strtr($input, [
+        "\\" => "\\\\", "'" => "\\'", '"' => '\\"',
+        "\0" => '\\0', "\n" => '\\n', "\r" => '\\r',
+        "\t" => '\\t', "\x08" => '\\b', "\x1a" => '\\Z',
+    ]) . "'";
 }
 
 /**
@@ -164,11 +178,28 @@ class DB {
     }
 
     /**
-     * @param null|mysqli $mysqli 
+     * Take ownership of an existing connection and establish the quoting contract.
+     * Charset/mode setup failure closes the handle and returns a disconnected DB.
+     * @param null|mysqli $mysqli
      * @return DB a new DB object, from existing connection
      */
-    public static function from(?\mysqli $mysqli) : DB { 
-        return new DB($mysqli);
+    public static function from(?\mysqli $mysqli) : DB {
+        $db = new DB($mysqli);
+        if ($mysqli === null) { return $db; }
+        try {
+            if (!mysqli_set_charset($mysqli, 'utf8mb4')) {
+                throw new RuntimeException('Unable to set database charset: ' . mysqli_error($mysqli));
+            }
+            if (mysqli_query($mysqli, DB_SQL_MODE_SETUP) !== true) {
+                throw new RuntimeException('Unable to set database SQL mode: ' . mysqli_error($mysqli));
+            }
+        } catch (Exception $ex) {
+            // Never expose a connection on which PHP-side quoting is unsafe.
+            $db->errors[] = $ex->getMessage();
+            mysqli_close($mysqli);
+            $db->_db = null;
+        }
+        return $db;
     }
 
     /**
@@ -228,16 +259,31 @@ class DB {
      * @return DB 
      */
     public static function connect(string $host, string $user, string $passwd, string $db_name) : DB {
-        $db = mysqli_init();
-        mysqli_options($db, MYSQLI_OPT_CONNECT_TIMEOUT, 3);
-        if(mysqli_real_connect($db, $host, $user, $passwd, $db_name)) {
-            $db = DB::from($db);
-            $db->host = $host;
-            $db->user = $user;
-            $db->database = $db_name;
+        $connection = mysqli_init();
+        if ($connection === false) {
+            $db = DB::from(null);
+            $db->errors[] = 'Unable to initialize database connection';
             return $db;
         }
-        return DB::from(NULL);
+        try {
+            if (!mysqli_options($connection, MYSQLI_OPT_CONNECT_TIMEOUT, 3)) {
+                throw new RuntimeException('Unable to set database connection timeout');
+            }
+            if (!mysqli_real_connect($connection, $host, $user, $passwd, $db_name)) {
+                throw new RuntimeException('Unable to connect to database: ' . mysqli_connect_error());
+            }
+        } catch (Exception $ex) {
+            mysqli_close($connection);
+            $db = DB::from(null);
+            $db->errors[] = $ex->getMessage();
+            return $db;
+        }
+        // from() configures new and externally supplied connections identically.
+        $db = DB::from($connection);
+        $db->host = $host;
+        $db->user = $user;
+        $db->database = $db_name;
+        return $db;
     }
 
     /**
@@ -455,10 +501,10 @@ class DB {
 
         // update on duplicate, exclude any PKS
         if ($on_duplicate === DB_DUPLICATE_UPDATE) {
-            if (!array_is_list($data)) {
-                throw new RuntimeException('Can only update on duplicate update with KVP for $data');
+            if (array_is_list($data)) {
+                throw new RuntimeException('Duplicate updates require an associative array of column values');
             }
-            $update_data = array_diff_key($data, $no_update);
+            $update_data = array_diff_key($data, $no_update ?? []);
             $suffix = "";
             foreach($update_data as $key => $value) {
                 $q_value = quote($value);
@@ -628,33 +674,34 @@ class DB {
     /**
      * store object data into table.  data must have public members and have the 
      * same names as the table
-     * @return bool true if the SQL write is successful
+     * @return int insert ID, or -1 when the write/ID fetch fails
      */
     public function store(string $table, Object $data, int $on_duplicate = DB_DUPLICATE_IGNORE) : int {
-        assert(is_resource($this->_db), "database not connected");
+        assert($this->_db instanceof mysqli, "database not connected");
 
-        // TODO: this should be it's own object to array function with tests
-        $r = new \ReflectionClass($data);
+        // ReflectionObject includes public dynamic fields as well as declared ones.
+        $r = new \ReflectionObject($data);
         $props = $r->getProperties(\ReflectionProperty::IS_PUBLIC);
         $no_updates = [];
         $if_null = [];
-        // turn the object into an array, update PKS for update list
-        $kvp = array_reduce($props, function($kvp, $item) use ($data, $on_duplicate, &$no_updates, &$if_null) {
+        // turn instance data into an array and build duplicate-update policies
+        $kvp = array_reduce($props, function($kvp, $item) use ($data, &$no_updates, &$if_null) {
+            if ($item->isStatic()) { return $kvp; }
             $name = $item->name;
             $attrs = $item->getAttributes();
 
             foreach ($attrs as $attr) {
                 $attribute = $attr->getName();
                 switch($attribute) {
-                    case "ThreadFinDB\NoUpdate":
+                    case NoUpdate::class:
                         $no_updates[$name] = true;
                         break;
-                    case "ThreadFinDB\NotNull":
-                        if (!isset($data->$name) || empty($data->$name)) {
+                    case NotNull::class:
+                        if (!isset($data->$name)) {
                             return $kvp;
                         }
                         break;
-                    case "ThreadFinDB\IfNull":
+                    case IfNull::class:
                         $if_null[$name] = true;
                 }
             }
@@ -736,8 +783,22 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
         return ($this->count() == 0);
     }
 
+    /** Return all buffered rows without disturbing the iterator's current row. */
     public function as_array(): array {
-        return mysqli_fetch_all($this->_mysqli_result, MYSQLI_ASSOC);
+        if (!$this->_mysqli_result || $this->_mysqli_result->num_rows === 0) {
+            return [];
+        }
+        // The current row was already fetched, so next() must resume after it.
+        $resume = $this->_position + 1;
+        $this->_mysqli_result->data_seek(0);
+        try {
+            return mysqli_fetch_all($this->_mysqli_result, MYSQLI_ASSOC);
+        } finally {
+            if ($resume < $this->_mysqli_result->num_rows) {
+                $this->_mysqli_result->data_seek($resume);
+            }
+            // Otherwise fetch_all left the cursor at EOF, which is already correct.
+        }
     }
 
     public function offsetExists(mixed $offset): bool {
@@ -822,10 +883,7 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
      * @return MaybeStr of column $name at current row index
      */
     public function col(string $name) : MaybeStr {
-        if (isset($this->_x[$this->_position])) {
-            return MaybeStr::of($this->_x[$this->_position][$name]??NULL);
-        } 
-        return MaybeStr::of(NULL);
+        return MaybeStr::of($this->_x[$name] ?? null);
     }
 
     /**
@@ -1072,10 +1130,10 @@ function dump_table(DB $db, callable $write_fn, array $row) : ?Offset {
 function dump_database(Credentials $cred, string $db_name, callable $write_fn, int $max_bytes = 1024*1024*50) : array {
     $header = "# Database export of ($db_name) began at UTC: " 
             . date(DATE_RFC3339) . "\n# UTC tv: " . utc_time() . "\n\n";
-    $init_sql = "SET NAMES 'utf8'\n";
+    // Restore the same charset/mode required by PHP-side quoted dump values.
+    $init_sql = "SET NAMES 'utf8mb4';\n" . DB_SQL_MODE_SETUP . ";\n";
 
-    $db = DB::cred_connect($cred);
-    $db->unsafe_raw($init_sql);
+    $db = DB::cred_connect($cred); // Connection setup already applied both settings.
     $tables = $db->fetch("SHOW TABLES");
     $write_fn($header . $init_sql);
 
