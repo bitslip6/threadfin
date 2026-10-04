@@ -810,7 +810,8 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
     }
 
     public function offsetExists(mixed $offset): bool {
-        return $offset <= $this->_len;
+        return $offset >= 0 && $offset < $this->_len
+            && ($this->_rows !== null || $this->_mysqli_result !== null);
     }
 
     public function offsetGet(mixed $offset): array {
