@@ -619,40 +619,50 @@ class DB {
 
 
     /**
-     * TODO: test if we can just pass $this->qb to the closure, instead of $this
-     * return a function that will insert key value pairs into $table.
-     * does not support {} replacement
+     * Buffer inserts until explicit flush (null/no argument) or DB_MAX_BULK_INSERT rows.
+     * Does not support {} replacement; identifiers remain trusted input.
      * @param string $table the table name
-     * @param array $columns column names in (col1, col2) or (col->data) format
-     * @return callable(?array $data) that takes KVP where array_values($columns)
-     *         value are indexes into $data. 
-     *         pass null as KVP data to run the bulk query and return 1 - success
-     *         0 - failure;
-     * 
+     * @param array $columns list of column names, or column => source-key mapping
+     * @return callable(?array $data): int pending row count, 1 on successful flush,
+     *         0 on empty flush, or -1 on failed flush (the batch is retained)
+     * @throws \InvalidArgumentException for empty columns or missing row fields
      */
-    public function bulk_fn(string $table, array $columns, bool $ignore_duplicate = true) : callable { 
+    public function bulk_fn(string $table, array $columns, bool $ignore_duplicate = true) : callable {
+        if (empty($columns)) {
+            throw new \InvalidArgumentException('Bulk inserts require at least one column');
+        }
+        if (array_is_list($columns)) {
+            $columns = array_combine($columns, $columns);
+        }
         $t = $this;
         $ignore = ($ignore_duplicate) ? "IGNORE" : "";
-        $num_columns = count($columns);
-        return function(?array $data = null) use (&$t, $table, $columns, $ignore, $num_columns) : int {
-            static $ctr = 0;
-            static $sql = "";
-            if ($data !== null) {
-                $ctr++;
-                $sql .= "(";
-                $column_count = 0;
-                foreach ($columns as $column_name => $key_name) {
-                    $sql .= quote($data[$key_name]);
-                    $sql .= (++$column_count < $num_columns) ? "," : "),\n";
-                }
-            }
-            if ($ctr > 0 || $ctr > DB_MAX_BULK_INSERT) {
-                $stmt = "INSERT $ignore INTO $table (" . join(",", array_keys($columns)) . ") VALUES " . substr($sql, 0, -2);
+        $prefix = "INSERT $ignore INTO $table (" . join(",", array_keys($columns)) . ") VALUES ";
+        $ctr = 0;
+        $sql = "";
+        $flush = function() use ($t, $prefix, &$ctr, &$sql): int {
+            if ($ctr === 0) { return 0; }
+            $status = $t->_qb($prefix . substr($sql, 0, -2));
+            if ($status >= 0) {
                 $ctr = 0;
                 $sql = "";
-                return $t->_qb($stmt);
             }
-            return $ctr;
+            return $status;
+        };
+        return function(?array $data = null) use ($columns, $flush, &$ctr, &$sql): int {
+            if ($data === null) { return $flush(); }
+            // Build the entire row before touching the buffer, preserving explicit nulls.
+            $values = [];
+            foreach ($columns as $key_name) {
+                if (!array_key_exists($key_name, $data)) {
+                    throw new \InvalidArgumentException("Missing bulk row field [$key_name]");
+                }
+                $values[] = quote($data[$key_name]);
+            }
+            // A failed full batch must be retried before accepting another row.
+            if ($ctr >= DB_MAX_BULK_INSERT && $flush() < 0) { return -1; }
+            $sql .= "(" . implode(",", $values) . "),\n";
+            $ctr++;
+            return ($ctr >= DB_MAX_BULK_INSERT) ? $flush() : $ctr;
         };
     }
 

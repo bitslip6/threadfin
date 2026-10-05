@@ -1027,6 +1027,110 @@ function db_fixture_run(string $case): mixed {
             $insert(['name' => 'bob', 'email' => 'b@example.test']);
             $insert();
             return $db->statements[0];
+        case 'bulk_flush_lifecycle':
+            $db = new DbStatementProbe();
+            $bulk = $db->bulk_fn('records', ['name']);
+            $statuses = [$bulk(), $bulk(['name' => 'alice']), $bulk(['name' => 'bob'])];
+            $before = $db->statements;
+            $statuses[] = $bulk();
+            $statuses[] = $bulk();
+            $statuses[] = $bulk(['name' => 'carol']);
+            $statuses[] = $bulk();
+            return [$statuses, $before, $db->statements];
+        case 'bulk_limit_boundary':
+            $db = new DbStatementProbe();
+            $bulk = $db->bulk_fn('records', ['id' => 'id']);
+            for ($id = 1; $id < \ThreadFin\DB\DB_MAX_BULK_INSERT; $id++) { $pending = $bulk(['id' => $id]); }
+            $before = [$pending, count($db->statements)];
+            $atLimit = $bulk(['id' => \ThreadFin\DB\DB_MAX_BULK_INSERT]);
+            $afterLimit = [$atLimit, count($db->statements)];
+            $next = $bulk(['id' => \ThreadFin\DB\DB_MAX_BULK_INSERT + 1]);
+            $afterNext = [$next, count($db->statements)];
+            $flush = $bulk();
+            return [$before, $afterLimit, $afterNext, $flush, $bulk(), $db->statements];
+        case 'bulk_column_forms':
+            $observations = [];
+            foreach ([['name', 'nil', 'zero', 'flag', 'code'],
+                      ['name' => 'source', 'nil' => 'nil', 'zero' => 'zero', 'flag' => 'flag', 'code' => 'code']] as $columns) {
+                $db = new DbStatementProbe();
+                $bulk = $db->bulk_fn('records', $columns);
+                $bulk(['name' => "O'Reilly", 'source' => "O'Reilly", 'nil' => null,
+                    'zero' => 0, 'flag' => false, 'code' => '00123', 'unused' => 'omit']);
+                $before = count($db->statements);
+                $bulk();
+                $observations[] = [$before, $db->statements];
+            }
+            return $observations;
+        case 'bulk_independent_closures':
+            $db = new DbStatementProbe();
+            $first = $db->bulk_fn('first', ['name'], false);
+            $second = $db->bulk_fn('second', ['name']);
+            $first(['name' => 'alice']);
+            $second(['name' => 'bob']);
+            $before = $db->statements;
+            $first();
+            $first(['name' => 'carol']);
+            $second();
+            $first();
+            return [$before, $db->statements];
+        case 'bulk_missing_row_is_atomic':
+            $db = new DbStatementProbe();
+            $bulk = $db->bulk_fn('records', ['name', 'nil']);
+            $bulk(['name' => 'alice', 'nil' => null]);
+            try {
+                $bulk(['name' => 'bad']);
+                $rejected = false;
+            } catch (Throwable $error) { $rejected = $error instanceof InvalidArgumentException; }
+            $before = $db->statements;
+            $bulk();
+            return [$rejected, $before, $db->statements];
+        case 'bulk_empty_columns':
+            try {
+                (new DbStatementProbe())->bulk_fn('records', []);
+                return false;
+            } catch (InvalidArgumentException $error) { return true; }
+        case 'bulk_simulated_batch':
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_simulation(true);
+            $handle->queries = [];
+            $bulk = $db->bulk_fn('records', ['name']);
+            $statuses = [$bulk(['name' => 'alice']), $bulk(['name' => 'bob'])];
+            $before = [$handle->queries, $db->logs];
+            $statuses[] = $bulk();
+            return ['statuses' => $statuses, 'before' => $before, 'queries' => $handle->queries,
+                'logs' => $db->logs, 'errors' => $db->errors];
+        case 'bulk_failed_flush_retry':
+            $handle = new mysqli();
+            $db = DB::from($handle);
+            $handle->queries = [];
+            $bulk = $db->bulk_fn('records', ['name']);
+            $sql = "INSERT IGNORE INTO records (name) VALUES ('alice'),\n('bob')";
+            $GLOBALS['db_fixture_query_failures'] = [$sql => 'false'];
+            $statuses = [$bulk(['name' => 'alice']), $bulk(['name' => 'bob']), $bulk()];
+            unset($GLOBALS['db_fixture_query_failures']);
+            $statuses[] = $bulk();
+            $statuses[] = $bulk();
+            $observed = [$statuses, $handle->queries, count($db->errors)];
+            $db->errors = []; // Isolate retry from the separate close/error-log regression.
+            return $observed;
+        case 'bulk_failed_full_batch_stays_bounded':
+            $handle = new mysqli();
+            $db = DB::from($handle);
+            $handle->queries = [];
+            $bulk = $db->bulk_fn('records', ['id' => 'id']);
+            $rows = array_map(fn($id) => '(' . $id . ')', range(1, \ThreadFin\DB\DB_MAX_BULK_INSERT));
+            $sql = 'INSERT IGNORE INTO records (id) VALUES ' . implode(",\n", $rows);
+            $GLOBALS['db_fixture_query_failures'] = [$sql => 'false'];
+            for ($id = 1; $id <= \ThreadFin\DB\DB_MAX_BULK_INSERT; $id++) { $last = $bulk(['id' => $id]); }
+            $blocked = $bulk(['id' => \ThreadFin\DB\DB_MAX_BULK_INSERT + 1]);
+            unset($GLOBALS['db_fixture_query_failures']);
+            $retry = $bulk(['id' => \ThreadFin\DB\DB_MAX_BULK_INSERT + 1]);
+            $flush = $bulk();
+            $observed = [[$last, $blocked, $retry, $flush, $bulk()],
+                array_map(fn($query) => substr_count($query, '(') - 1, $handle->queries),
+                count($db->errors), end($handle->queries)];
+            $db->errors = [];
+            return $observed;
         case 'error_logging':
             $db = DB::from(new mysqli());
             $db->errors[] = '[BAD SQL] errno(1064) Syntax error near BAD';

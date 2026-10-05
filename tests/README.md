@@ -3,19 +3,20 @@
 These are expected-behavior TinyTest tests, not tests that expect the current bugs.
 The initial baseline was **41 failed / 0 passed / 0 incomplete / 0 skipped**.
 The SQL-injection work expanded it to **44 failed / 0 passed** before the fix.
-The current suite has **137 tests: 127 passed / 10 failed**, exit 1, with no
+The current suite has **146 tests: 138 passed / 8 failed**, exit 1, with no
 incomplete cases, skips, or runner errors. Quoting, connection failure handling,
 the dump charset-statement terminator, current-row column lookup, complete
 buffered-result array conversion, associative duplicate updates, object
 store/attribute mapping, cursor synchronization, invalid array-read rejection,
 array-backed result operations, row-offset existence bounds, the dumper's
 result map/reduce methods, dump byte budgets, requested-database selection,
-query simulation, null/missing template-parameter handling, NULL predicates, and
-falsey `upsert_fn()` updates now pass. Other reviewed bugs remain unfixed.
+query simulation, null/missing template-parameter handling, NULL predicates,
+falsey `upsert_fn()` updates, and buffered bulk inserts now pass. Other reviewed
+bugs remain unfixed.
 
 ## Current status
 
-Verified with the default TinyTest runner: **137 total, 127 passed, 10 failed**.
+Verified with the default TinyTest runner: **146 total, 138 passed, 8 failed**.
 There are **0 incomplete tests, 0 skipped tests, and 0 runner errors**. Exit code
 1 comes from the outstanding regressions, not a runner/setup failure. Counts below
 are test functions, not assertions or separate bugs.
@@ -24,11 +25,12 @@ are test functions, not assertions or separate bugs.
 | --- | ---: | ---: | ---: |
 | `test_db_array_results.php` | 8 | 0 | 8 |
 | `test_db_bounds.php` | 5 | 0 | 5 |
+| `test_db_bulk.php` | 9 | 0 | 9 |
 | `test_db_connection.php` | 5 | 0 | 5 |
 | `test_db_cursor.php` | 7 | 0 | 7 |
 | `test_db_dump.php` | 10 | 0 | 10 |
 | `test_db_duplicate_updates.php` | 4 | 0 | 4 |
-| `test_db_regressions.php` | 36 | 10 | 46 |
+| `test_db_regressions.php` | 38 | 8 | 46 |
 | `test_db_result_reads.php` | 9 | 0 | 9 |
 | `test_db_simulation.php` | 8 | 0 | 8 |
 | `test_db_store.php` | 6 | 0 | 6 |
@@ -36,26 +38,25 @@ are test functions, not assertions or separate bugs.
 | `test_db_transforms.php` | 10 | 0 | 10 |
 | `test_db_upsert.php` | 6 | 0 | 6 |
 | `test_db_where.php` | 5 | 0 | 5 |
-| **Total** | **127** | **10** | **137** |
+| **Total** | **138** | **8** | **146** |
 
 ### Remaining failures
 
-All 10 failing functions are in `test_db_regressions.php`. The names below omit
+All 8 failing functions are in `test_db_regressions.php`. The names below omit
 only the common **`test_db_`** prefix. This is the current fix backlog; the broader
 coverage table below includes both fixed and outstanding regressions.
 
 | Outstanding issue | Failing test suffixes | Count |
 | --- | --- | ---: |
-| Bulk inserts flush immediately/use numeric column names | `bulk_insert_buffers_until_flush_or_limit`, `bulk_insert_accepts_list_column_names` | 2 |
 | Non-duplicate SQL errors discarded | `close_logs_non_duplicate_sql_errors` | 1 |
 | Replay loses DDL/rollback semantics and duplicates on close | `replay_records_successful_ddl`, `replay_does_not_commit_rolled_back_writes`, `repeated_close_does_not_duplicate_replay` | 3 |
 | Stream falsey strings, short writes, cross-stream totals | `stream_writes_literal_zero`, `stream_retries_short_writes`, `stream_byte_totals_are_per_stream` | 3 |
 | Stored SQL text replaced by result wrapper | `result_retains_original_sql_text` | 1 |
-| **Total** | | **10** |
+| **Total** | | **8** |
 
 The opt-in live-server suite is separate from these totals. Its last verification
 was **3 passed, 0 failed** on disposable MariaDB 12.3.3; it was not rerun for this
-falsey `upsert_fn()` fix. See the integration section below.
+buffered bulk-insert fix. See the integration section below.
 
 ## Running tests
 
@@ -68,6 +69,7 @@ php /home/cory/Work/tinytest/tinytest.php -x -d tests
 php /home/cory/Work/tinytest/tinytest.php -v -f tests/test_db_regressions.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_array_results.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_bounds.php
+php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_bulk.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_connection.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_cursor.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_dump.php
@@ -394,6 +396,33 @@ all six now pass. They cover mixed values, allowed keys, custom/raw-prefixed pri
 keys, raw zero, repeated closure calls, PK-only/positional compatibility, and real
 execution/simulation paths against the mysqli boundary. The two original zero/false
 regressions also pass. No live-server tests were rerun for this change.
+
+## Buffered bulk-insert fixes
+
+`bulk_fn()` now buffers rows until an explicit null/no-argument flush or exactly
+`DB_MAX_BULK_INSERT` (64) pending rows. List-form columns map to same-named input
+fields; associative declarations retain column-to-source-key mapping. Both forms
+preserve declaration order, falsey/null values, and shared quoting. Identifiers
+remain trusted input, and the duplicate-ignore option is unchanged.
+
+Each returned closure has independent buffer state. Row construction validates
+all source fields and completes quoting before appending, so missing-field errors
+do not corrupt pending SQL. Empty column declarations and missing row fields
+raise `InvalidArgumentException`; explicit null field values are valid.
+
+Buffering returns the pending row count. Flush returns `1` on success, `0` when
+empty, and `-1` on execution failure. Only successful flushes clear pending data.
+A failed full batch is retried before accepting another row, keeping every batch
+within the limit; if that retry fails, the new row is not accepted. Explicit
+flush is still required for any remainder; closing DB is not an automatic flush.
+Retaining failed SQL permits retry, not exactly-once delivery after ambiguous
+network failures. Simulation logs a complete batch only when it is flushed.
+
+`test_db_bulk.php` adds nine cases; all nine failed before the fix and now pass.
+They cover flush lifecycle, exact-limit boundaries, column forms, independent
+closures, validation, simulation, and partial/full-batch retries against the
+mysqli boundary. The two original bulk regressions also pass. No live-server
+tests were rerun for this change.
 
 ## Required connection and client-escaping contract
 
