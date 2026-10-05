@@ -12,7 +12,7 @@ function db_fixture_file(): string {
     $GLOBALS['fixtureFiles'][] = $path;
     return $path;
 }
-define('SQL_ERROR_FILE', db_fixture_file());
+define('SQL_ERROR_FILE', ($argv[1] ?? '') === 'error_log_disabled' ? false : db_fixture_file());
 require __DIR__ . '/../../core.php';
 require __DIR__ . '/../../db.php';
 
@@ -1136,6 +1136,77 @@ function db_fixture_run(string $case): mixed {
             $db->errors[] = '[BAD SQL] errno(1064) Syntax error near BAD';
             $db->close();
             return file_get_contents(SQL_ERROR_FILE);
+        case 'error_log_mixed':
+            file_put_contents(SQL_ERROR_FILE, "existing log\n");
+            $db = DB::from(new mysqli());
+            $db->errors = [
+                '[BAD SQL] errno(1064) Syntax error near BAD',
+                "[INSERT INTO records VALUES (1)] errno(1062) Duplicate entry '1' for key 'PRIMARY'",
+                '[LOCK SQL] errno(1213) Deadlock found when trying to get lock',
+                '[SELECT Duplicate FROM records] errno(1064) Syntax error near Duplicate',
+                'Connection refused (fixture)',
+                '[INSERT INTO records VALUES (2)] errno(1062) Une entrée existe déjà',
+            ];
+            $before = $db->errors;
+            $db->close();
+            return ['log' => file_get_contents(SQL_ERROR_FILE), 'before' => $before, 'errors' => $db->errors];
+        case 'error_log_duplicate_only':
+            $seed = "existing log\n";
+            file_put_contents(SQL_ERROR_FILE, $seed);
+            $logs = [];
+            foreach (["Duplicate entry '1' for key 'PRIMARY'", "duplicate entry '2' for key 'PRIMARY'",
+                      "write failed: DUPLICATE entry '3' for key 'PRIMARY'",
+                      "[INSERT INTO records VALUES (4)] errno(1062) Duplicate entry '4' for key 'PRIMARY'"] as $error) {
+                $db = DB::from(new mysqli());
+                $db->errors[] = $error;
+                $db->close();
+                $logs[] = file_get_contents(SQL_ERROR_FILE);
+            }
+            return $logs;
+        case 'error_log_uncoded':
+            $db = DB::from(new mysqli());
+            $db->errors = ['Connection refused', '0', '', 'Accès refusé'];
+            $db->close();
+            return [file_get_contents(SQL_ERROR_FILE), $db->errors];
+        case 'error_log_public_failures':
+            $observations = [];
+            $sqls = ['BAD WRITE', 'SELECT BAD', "UPDATE records\nSET Duplicate = BAD", "SELECT 'Duplicate entry' FROM broken"];
+            foreach (['false', 'exception'] as $failure) {
+                $handle = new mysqli();
+                $db = DB::from($handle);
+                $GLOBALS['db_fixture_query_failures'] = array_fill_keys($sqls, $failure);
+                $statuses = [];
+                foreach ($sqls as $index => $sql) {
+                    $statuses[] = $index % 2 === 0 ? $db->unsafe_raw($sql) : count($db->fetch($sql));
+                }
+                unset($GLOBALS['db_fixture_query_failures']);
+                $db->close();
+                $observations[] = [$statuses, $db->errors, $handle->closed];
+            }
+            return [$observations, file_get_contents(SQL_ERROR_FILE)];
+        case 'error_log_setup_failures':
+            $observations = [];
+            foreach (['mode_false', 'mode_exception'] as $failure) {
+                $GLOBALS['db_fixture_setup_failure'] = $failure;
+                $handle = new mysqli();
+                $db = DB::from($handle);
+                unset($GLOBALS['db_fixture_setup_failure']);
+                $db->close();
+                $observations[] = [$db->connected(), $handle->closed, $db->errors];
+            }
+            return [$observations, file_get_contents(SQL_ERROR_FILE)];
+        case 'error_log_empty':
+            file_put_contents(SQL_ERROR_FILE, "existing log\n");
+            $handle = new mysqli();
+            $db = DB::from($handle);
+            $db->close();
+            return [file_get_contents(SQL_ERROR_FILE), $handle->closed, $db->errors];
+        case 'error_log_disabled':
+            $handle = new mysqli();
+            $db = DB::from($handle);
+            $db->errors[] = '[BAD SQL] errno(1064) Syntax error near BAD';
+            $db->close();
+            return [SQL_ERROR_FILE, $handle->closed, $db->errors, count($GLOBALS['fixtureFiles'])];
         case 'replay_ddl':
             $path = db_fixture_file();
             $db = DB::from(new mysqli())->enable_replay($path);

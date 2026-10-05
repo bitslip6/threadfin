@@ -3,7 +3,7 @@
 These are expected-behavior TinyTest tests, not tests that expect the current bugs.
 The initial baseline was **41 failed / 0 passed / 0 incomplete / 0 skipped**.
 The SQL-injection work expanded it to **44 failed / 0 passed** before the fix.
-The current suite has **146 tests: 138 passed / 8 failed**, exit 1, with no
+The current suite has **153 tests: 146 passed / 7 failed**, exit 1, with no
 incomplete cases, skips, or runner errors. Quoting, connection failure handling,
 the dump charset-statement terminator, current-row column lookup, complete
 buffered-result array conversion, associative duplicate updates, object
@@ -11,12 +11,12 @@ store/attribute mapping, cursor synchronization, invalid array-read rejection,
 array-backed result operations, row-offset existence bounds, the dumper's
 result map/reduce methods, dump byte budgets, requested-database selection,
 query simulation, null/missing template-parameter handling, NULL predicates,
-falsey `upsert_fn()` updates, and buffered bulk inserts now pass. Other reviewed
-bugs remain unfixed.
+falsey `upsert_fn()` updates, buffered bulk inserts, and non-duplicate error
+logging now pass. Other reviewed bugs remain unfixed.
 
 ## Current status
 
-Verified with the default TinyTest runner: **146 total, 138 passed, 8 failed**.
+Verified with the default TinyTest runner: **153 total, 146 passed, 7 failed**.
 There are **0 incomplete tests, 0 skipped tests, and 0 runner errors**. Exit code
 1 comes from the outstanding regressions, not a runner/setup failure. Counts below
 are test functions, not assertions or separate bugs.
@@ -30,7 +30,8 @@ are test functions, not assertions or separate bugs.
 | `test_db_cursor.php` | 7 | 0 | 7 |
 | `test_db_dump.php` | 10 | 0 | 10 |
 | `test_db_duplicate_updates.php` | 4 | 0 | 4 |
-| `test_db_regressions.php` | 38 | 8 | 46 |
+| `test_db_error_logging.php` | 7 | 0 | 7 |
+| `test_db_regressions.php` | 39 | 7 | 46 |
 | `test_db_result_reads.php` | 9 | 0 | 9 |
 | `test_db_simulation.php` | 8 | 0 | 8 |
 | `test_db_store.php` | 6 | 0 | 6 |
@@ -38,25 +39,24 @@ are test functions, not assertions or separate bugs.
 | `test_db_transforms.php` | 10 | 0 | 10 |
 | `test_db_upsert.php` | 6 | 0 | 6 |
 | `test_db_where.php` | 5 | 0 | 5 |
-| **Total** | **138** | **8** | **146** |
+| **Total** | **146** | **7** | **153** |
 
 ### Remaining failures
 
-All 8 failing functions are in `test_db_regressions.php`. The names below omit
+All 7 failing functions are in `test_db_regressions.php`. The names below omit
 only the common **`test_db_`** prefix. This is the current fix backlog; the broader
 coverage table below includes both fixed and outstanding regressions.
 
 | Outstanding issue | Failing test suffixes | Count |
 | --- | --- | ---: |
-| Non-duplicate SQL errors discarded | `close_logs_non_duplicate_sql_errors` | 1 |
 | Replay loses DDL/rollback semantics and duplicates on close | `replay_records_successful_ddl`, `replay_does_not_commit_rolled_back_writes`, `repeated_close_does_not_duplicate_replay` | 3 |
 | Stream falsey strings, short writes, cross-stream totals | `stream_writes_literal_zero`, `stream_retries_short_writes`, `stream_byte_totals_are_per_stream` | 3 |
 | Stored SQL text replaced by result wrapper | `result_retains_original_sql_text` | 1 |
-| **Total** | | **8** |
+| **Total** | | **7** |
 
 The opt-in live-server suite is separate from these totals. Its last verification
 was **3 passed, 0 failed** on disposable MariaDB 12.3.3; it was not rerun for this
-buffered bulk-insert fix. See the integration section below.
+non-duplicate error-logging fix. See the integration section below.
 
 ## Running tests
 
@@ -76,6 +76,7 @@ php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_dump.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_result_reads.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_simulation.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_duplicate_updates.php
+php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_error_logging.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_store.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_templates.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_transforms.php
@@ -423,6 +424,29 @@ They cover flush lifecycle, exact-limit boundaries, column forms, independent
 closures, validation, simulation, and partial/full-batch retries against the
 mysqli boundary. The two original bulk regressions also pass. No live-server
 tests were rerun for this change.
+
+## Non-duplicate error-logging fix
+
+`DB::close()` now retains non-duplicate errors for file output instead of selecting
+only errors containing `Duplicate`. Generated `[sql] errno(n) message` diagnostics
+use code `1062` to identify duplicate-key errors; other codes remain logged even
+when SQL or error text contains `Duplicate`. Diagnostics without that query-error
+format retain case-insensitive keyword suppression, using strict comparison so
+matches at offset zero are also suppressed.
+
+Only a nonempty filtered set is appended, avoiding empty `Array()` blocks when
+all errors are duplicates. Existing file contents, `print_r` formatting, array
+keys/order, and the complete public `errors` list are preserved. A false
+`SQL_ERROR_FILE` still disables file output without preventing handle closure.
+Explicit close can log setup errors even when factory cleanup already disconnected
+the wrapper. Replay handling and repeated-close semantics are unchanged here.
+
+`test_db_error_logging.php` adds seven cases (five failed before the fix, two
+already passed); all seven now pass. They cover mixed/duplicate-only diagnostics,
+uncoded and falsey text, public write/read failures through both driver failure
+modes, multiline SQL, connection-setup errors, empty logs, and disabled output.
+The original non-duplicate logging regression also passes. All file output uses
+isolated temporary paths (or is disabled); no live-server tests were rerun.
 
 ## Required connection and client-escaping contract
 

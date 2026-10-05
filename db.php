@@ -735,8 +735,15 @@ class DB {
         if (!empty($this->_db)) { mysqli_close($this->_db); $this->_db = NULL; }
         if (SQL_ERROR_FILE) {
             if (count($this->errors) > 0) {
-                $errors = array_filter($this->errors, function($x) { return stripos($x, "Duplicate") != false; });
-                if (count($this->errors) > 0) {
+                $errors = array_filter($this->errors, function($error): bool {
+                    // Generated query diagnostics carry errno; SQL text may itself say Duplicate.
+                    if (preg_match('/\A\[.*\] errno\((\d+)\) /s', $error, $match) === 1) {
+                        return $match[1] !== '1062';
+                    }
+                    // Retain the legacy keyword policy for diagnostics without a query errno.
+                    return stripos($error, 'Duplicate') === false;
+                });
+                if (count($errors) > 0) {
                     file_put_contents(SQL_ERROR_FILE, print_r($errors, true), FILE_APPEND);
                 }
             }
