@@ -43,20 +43,45 @@ class DbStatementProbe extends DB {
     }
 }
 
-/** Filesystem boundary only: force a zero-progress replay write, then allow retry. */
+/** Filesystem boundary only: inject append/flush failure and expose seek/truncate recovery. */
 class DbReplayWriteFixture {
     public $context;
     public static bool $blocked = true;
+    public static ?int $failAfter = null;
+    public static bool $failFlushOnce = false;
     public static string $contents = '';
+    private int $position = 0;
+    private int $written = 0;
     public function url_stat($path, $flags): array { return ['mode' => 0100666, 'size' => strlen(self::$contents)]; }
     public function stream_open($path, $mode, $options, &$openedPath): bool { return true; }
     public function stream_lock($operation): bool { return true; }
+    public function stream_seek($offset, $whence): bool {
+        $this->position = match ($whence) {
+            SEEK_END => strlen(self::$contents) + $offset,
+            SEEK_CUR => $this->position + $offset,
+            default => $offset,
+        };
+        return $this->position >= 0;
+    }
+    public function stream_tell(): int { return $this->position; }
+    public function stream_truncate($size): bool {
+        self::$contents = substr(self::$contents, 0, $size);
+        $this->position = min($this->position, $size);
+        return true;
+    }
     public function stream_write($data): int {
         if (self::$blocked) { return 0; }
-        self::$contents .= $data;
-        return strlen($data);
+        $bytes = self::$failAfter === null ? strlen($data) : min(strlen($data), max(0, self::$failAfter - $this->written));
+        self::$contents = substr(self::$contents, 0, $this->position) . substr($data, 0, $bytes)
+            . substr(self::$contents, $this->position + $bytes);
+        $this->position += $bytes;
+        $this->written += $bytes;
+        return $bytes;
     }
-    public function stream_flush(): bool { return true; }
+    public function stream_flush(): bool {
+        if (self::$failFlushOnce) { self::$failFlushOnce = false; return false; }
+        return true;
+    }
     public function stream_close(): void {}
 }
 
@@ -176,6 +201,8 @@ function db_fixture_dump(int $budget = 52428800, string $database = 'configured'
         'queries' => $GLOBALS['db_fixture_last_connection']->queries,
         'database' => $GLOBALS['db_fixture_connected_database'], 'credential_database' => $cred->db_name];
 }
+
+require __DIR__ . '/hardening_cases.php';
 
 function db_fixture_run(string $case): mixed {
     switch ($case) {
@@ -1471,7 +1498,7 @@ function db_fixture_run(string $case): mixed {
             $stored = db_fixture_property(db_fixture_result(), '_sql');
             return is_string($stored) ? $stored : get_debug_type($stored);
         default:
-            throw new InvalidArgumentException("Unknown regression case: $case");
+            return db_hardening_case($case);
     }
 }
 

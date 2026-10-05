@@ -113,6 +113,10 @@ function mysqli_query(mysqli $db, string $sql): mysqli_result|bool {
         }
         return false;
     }
+    if ($sql === 'SELECT @@SESSION.sql_mode AS sql_mode, @@SESSION.autocommit AS autocommit') {
+        return new mysqli_result([['sql_mode' => $db->sql_mode,
+            'autocommit' => $GLOBALS['db_fixture_replay_autocommit'] ?? 1]]);
+    }
     if ($sql === \ThreadFin\DB\DB_SQL_MODE_SETUP) {
         if (($GLOBALS['db_fixture_setup_failure'] ?? '') === 'mode_exception') {
             throw new mysqli_sql_exception('SQL mode setup rejected (fixture)');

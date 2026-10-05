@@ -11,12 +11,9 @@ use mysqli;
 use mysqli_result;
 use OutOfBoundsException;
 use RuntimeException;
-use ThreadFin\Core\MaybeA;
 use ThreadFin\Core\MaybeStr;
 
-use function ThreadFin\Util\func_name;
 use function ThreadFin\Core\partial_right as bind_r;
-use function ThreadFin\Core\partial as bind_l;
 use function ThreadFin\Log\debug;
 use function ThreadFin\Util\utc_time;
 
@@ -163,9 +160,9 @@ class DB {
     protected $_log_enabled = false;
     protected $_simulation = false;
     protected $_replay_enabled = false;
-    protected $_err_filter_fn;
     protected $_replay_file = "";
     protected $_replay = [];
+    protected string $_replay_header = '';
 
     protected function __construct(?\mysqli $db) { $this->_db = $db; }
 
@@ -216,13 +213,30 @@ class DB {
      * @return DB 
      */
     public function enable_replay(string $replay_file_name) : DB {
-        // attempt to create the replay file if it does not exist
-        if (!file_exists($replay_file_name)) {
-            touch($replay_file_name);
-            if (!file_exists($replay_file_name)) {
-                die("could not create replay file: $replay_file_name");
+        if ($this->_replay_enabled) {
+            if ($replay_file_name !== $this->_replay_file) {
+                throw new \LogicException('Cannot change replay destination during a database session');
             }
+            return $this;
         }
+        if ($replay_file_name === '' || stripos($replay_file_name, '.php') !== false) {
+            throw new \InvalidArgumentException('Replay requires a non-PHP journal path');
+        }
+        if (!$this->_db) { throw new RuntimeException('Replay requires a connected database'); }
+        // Enable before application queries; capture the session defaults used by those queries.
+        $result = mysqli_query($this->_db, 'SELECT @@SESSION.sql_mode AS sql_mode, @@SESSION.autocommit AS autocommit');
+        if (!$result instanceof mysqli_result) { throw new RuntimeException('Unable to inspect replay session'); }
+        try { $session = $result->fetch_assoc(); }
+        finally { $result->free(); }
+        if (!isset($session['sql_mode'], $session['autocommit']) || !in_array((string)$session['autocommit'], ['0', '1'], true)) {
+            throw new RuntimeException('Invalid replay session settings');
+        }
+        $fp = @fopen($replay_file_name, 'c+b');
+        if ($fp === false) { throw new RuntimeException('Unable to create replay log: ' . $replay_file_name); }
+        fclose($fp);
+        $this->_replay_header = "\n-- ThreadFin replay session\nROLLBACK;\nSET NAMES utf8mb4;\n"
+            . 'SET SESSION sql_mode = ' . quote($session['sql_mode']) . ";\n"
+            . 'SET SESSION autocommit = ' . $session['autocommit'] . ";\n";
         $this->_replay_file = $replay_file_name;
         $this->_replay_enabled = true;
         return $this;
@@ -250,7 +264,7 @@ class DB {
     }
 
     /**
-     * @todo: add support for retry.  busy network environments can cause connection failures
+     * Connection failures return a disconnected wrapper; callers decide whether to retry.
      * 
      * @param string $host 
      * @param string $user 
@@ -382,13 +396,11 @@ class DB {
         else {
             if ($this->_log_enabled) {
                 $e = mysqli_affected_rows($this->_db);
-                // $this->logs[] = $sql;
                 $msg = "# [$sql] errno($errno) selected rows($e)";
                 $this->logs[] = $msg;
             }
         }
 
-        //return SQL::from(mysqli_fetch_all($r, $mode), $sql);
         return SQL::fetch($r, $sql);
     }
 
@@ -408,7 +420,7 @@ class DB {
         $new_sql = $this->fetch_to_statement($sql, $data, $mode);
 
         // runtime errors
-        if ($this->_db == NULL) { return SQL::from(NULL, $sql); }
+        if ($this->_db == NULL) { return SQL::from(NULL, $new_sql); }
         return $this->_qr($new_sql, $mode);
     }
 
@@ -494,8 +506,7 @@ class DB {
 
         if (! array_is_list($data)) {
             $value_sql = $this->insert_sql($data);
-            $sql = "INSERT $ignore INTO `$table` $value_sql ";//(`" . join("`,`", array_keys($data)) . 
-            //"`) VALUES (" . join(",", array_map('\ThreadFin\DB\quote', array_values($data))).")";
+            $sql = "INSERT $ignore INTO `$table` $value_sql ";
         } else {
             $sql = "INSERT $ignore INTO `$table` VALUES (" . join(",", array_map('\ThreadFin\DB\quote', $data)).")";
         }
@@ -675,7 +686,6 @@ class DB {
      */
     public function update(string $table, array $data, array $where, int $return_type = DB_FETCH_NUM_ROWS) : int {
         // unset all where keys in data. this makes no sense when where is a PK
-        //do_for_all_key($where, function ($x) use (&$data) { unset($data[$x]); });
         array_walk($where, function ($value, $key) use (&$data) { unset($data[$key]); });
 
         // glue does the escaping for us here...
@@ -749,39 +759,38 @@ class DB {
                 }
             }
         }
-        if (!empty($this->_replay_file)) {
-            echo "writing replay log to: ". $this->_replay_file . "\n";
-            if (stristr($this->_replay_file, ".php")) {
-                die("refusing to write replay log to: ". $this->_replay_file);
+        if ($this->_replay !== []) { $this->flush_replay(); }
+    }
+
+    /** Append one isolated session; recover a failed append while still holding the lock. */
+    private function flush_replay(): void {
+        $fp = @fopen($this->_replay_file, 'c+b');
+        if ($fp === false) { throw new RuntimeException('Unable to open replay log: ' . $this->_replay_file); }
+        $locked = false;
+        try {
+            $locked = flock($fp, LOCK_EX);
+            if (!$locked) { throw new RuntimeException('Unable to lock replay log: ' . $this->_replay_file); }
+            if (fseek($fp, 0, SEEK_END) !== 0 || ($checkpoint = ftell($fp)) === false) {
+                throw new RuntimeException('Replay log must support seek and truncate');
             }
-        }
-        if (count($this->_replay) >= 1) {
-            $attempts = 10;
-            while ($attempts-- > 0) {
-                echo "writing replay log to: ". $this->_replay_file . "\n";
-                $fp = fopen($this->_replay_file, "a+");
-                if ($fp === false) {
-                    throw new RuntimeException('Unable to open replay log: ' . $this->_replay_file);
+            // Put delimiters on their own lines so trailing SQL comments cannot swallow them.
+            $chunk = $this->_replay_header . implode("\n;\n", $this->_replay)
+                . "\n;\nROLLBACK;\nSET SESSION autocommit = 1;\n-- End ThreadFin replay session\n";
+            try {
+                if (stream_output_fn($chunk, $fp) < 0 || !fflush($fp)) {
+                    throw new RuntimeException('Unable to write replay log: ' . $this->_replay_file);
                 }
-                if (flock($fp, LOCK_EX)) {
-                    try {
-                        $chunk = "\n" . implode(";\n", $this->_replay) . ";\n";
-                        if (stream_output_fn($chunk, $fp) < 0 || !fflush($fp)) {
-                            throw new RuntimeException('Unable to write replay log: ' . $this->_replay_file);
-                        }
-                        // Consume only after the complete journal has been written and flushed.
-                        $this->_replay = [];
-                    } finally {
-                        flock($fp, LOCK_UN);
-                        fclose($fp);
-                    }
-                    return;
+            } catch (\Throwable $error) {
+                // No concurrent writer can observe/reuse our checkpoint until recovery finishes.
+                if (!@ftruncate($fp, $checkpoint) || !@fflush($fp)) {
+                    throw new RuntimeException('Replay recovery failed; repair journal before retrying', 0, $error);
                 }
-                fclose($fp);
-                sleep(1);
-                echo "!!!! PANIC !!!! Couldn't get the lock for replay file!\n";
+                throw $error;
             }
-            throw new RuntimeException('Unable to lock replay log: ' . $this->_replay_file);
+            $this->_replay = [];
+        } finally {
+            if ($locked) { flock($fp, LOCK_UN); }
+            fclose($fp);
         }
     }
 }
@@ -791,14 +800,11 @@ class DB {
  * SQL result abstraction
  */
 class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
-    protected $_x;
-    protected $_data = NULL;
-    protected $_position = 0;
-    protected $_errors;
-    protected $_sql;
-    protected $_len;
-    protected $_fetch_all;
-    protected $_mysqli_result;
+    protected ?array $_x = null;
+    protected int $_position = 0;
+    protected string $_sql = '';
+    protected int $_len = 0;
+    protected ?mysqli_result $_mysqli_result = null;
     // Array-backed datasets are separate from the iterator's current row (_x).
     protected ?array $_rows = null;
 
@@ -837,12 +843,29 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
         }
     }
 
+    /** Integer strings are supported; other scalar types must not coerce into row positions. */
+    private static function row_offset(mixed $offset): ?int {
+        if (is_int($offset)) { return $offset; }
+        if (!is_string($offset) || preg_match('/\A[+-]?[0-9]+\z/', $offset) !== 1) { return null; }
+        $negative = $offset[0] === '-';
+        $digits = ltrim(ltrim($offset, '+-'), '0');
+        if ($digits === '') { return 0; }
+        $limit = $negative ? substr((string)PHP_INT_MIN, 1) : (string)PHP_INT_MAX;
+        if (strlen($digits) > strlen($limit) || (strlen($digits) === strlen($limit) && strcmp($digits, $limit) > 0)) {
+            return null;
+        }
+        return (int)($negative ? '-' . $digits : $digits);
+    }
+
     public function offsetExists(mixed $offset): bool {
-        return $offset >= 0 && $offset < $this->_len
+        $offset = self::row_offset($offset);
+        return $offset !== null && $offset >= 0 && $offset < $this->_len
             && ($this->_rows !== null || $this->_mysqli_result !== null);
     }
 
     public function offsetGet(mixed $offset): array {
+        $offset = self::row_offset($offset);
+        if ($offset === null) { throw new OutOfBoundsException('Row offset must be an integer or integer string'); }
         if ($offset < 0 || $offset >= $this->_len) {
             throw new OutOfBoundsException("row offset [$offset] is out of bounds");
         }
@@ -868,17 +891,18 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
     }
 
     public function offsetSet(mixed $offset, mixed $value): void {
-        throw new OutOfBoundsException("set not implemented");
+        throw new OutOfBoundsException('SQL results are read-only');
     }
 
     public function offsetUnset(mixed $offset): void {
-        throw new OutOfBoundsException("unset not implemented");
+        throw new OutOfBoundsException('SQL results are read-only');
     }
 
     /**
      * create a new SQL result abstraction from an array of associative rows
      * @param null|array $x rows in iteration order, normalized to zero-based offsets
      * @param string $in_sql the sql that generated the result
+     * @param bool $fetch_all retained for named-argument compatibility; results are always buffered
      * @return SQL 
      */
     public static function from(?array $x, string $in_sql="", bool $fetch_all = true) : SQL { 
@@ -887,7 +911,6 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
         $sql->_len = count($sql->_rows);
         $sql->_x = $sql->_rows[0] ?? null;
         $sql->_sql = $in_sql;
-        $sql->_fetch_all = $fetch_all;
         return $sql; 
     }
 
@@ -919,7 +942,7 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
         $this->_position = $offset;
     }
 
-    public function current() : array {
+    public function current() : ?array {
         return $this->_x;
     }
 
@@ -933,6 +956,8 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
             $this->_x = $this->_rows[$this->_position] ?? null;
         } else if ($this->_mysqli_result) {
             $this->_x = $this->_mysqli_result->fetch_assoc();
+        } else {
+            $this->_x = null;
         }
     }
 
@@ -940,9 +965,11 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
         $this->_position = 0;
         if ($this->_rows !== null) {
             $this->_x = $this->_rows[0] ?? null;
-        } else if ($this->_mysqli_result) {
+        } else if ($this->_mysqli_result && $this->_len > 0) {
             $this->_mysqli_result->data_seek(0);
             $this->_x = $this->_mysqli_result->fetch_assoc();
+        } else {
+            $this->_x = null;
         }
     }
 
@@ -957,52 +984,6 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
         return MaybeStr::of($this->_x[$name] ?? null);
     }
 
-    /**
-     * @return bool true if column name has a row with at least one value of $value 
-     *
-    public function in_set(string $name, string $value) : bool {
-        return array_reduce($this->_x, function ($carry, $item) use ($name, $value) {
-            return $carry || $item[$name] == $value;
-        }, false);
-    }
-
-    /**
-     * @return MaybeA of result row at $idx or current row indx
-     *
-    public function row(?int $idx = NULL) : MaybeA {
-        $idx = ($idx !== NULL) ? $idx : $this->_position;
-        if (isset($this->_x[$idx])) {
-            return MaybeA::of($this->_x[$idx]);
-        }
-        return MaybeA::of(NULL);
-    }
-
-    /**
-     * return true if data has a row at index $idx
-     *
-    public function has_row(int $idx = 0) : bool {
-        return isset($this->_x[$idx]);
-    }
-
-    /**
-     * call $fn on current $this->_data (see set_row, set_col)
-     * @param bool $spread if true, call $fn(...$this->_data)
-     *
-    public function ondata(callable $fn, bool $spread = false) : SQL {
-        if (!empty($this->_data)) {
-            $this->_data = 
-                ($spread) ?
-                $fn(...$this->_data) :
-                $fn($this->_data);
-        } else {
-            $this->_errors[] = "wont call " . func_name($fn) . " on data : " . var_export($this->_data, true);
-        }
-
-        return $this;
-    }
-
-    */
-
     /** Map every buffered row without changing the iterator's position. */
     public function map(callable $fn) : array {
         return array_map($fn, $this->as_array());
@@ -1013,46 +994,16 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
         return array_reduce($this->as_array(), $fn, $initial);
     }
 
-    /*
-    // run an a function that has external effect on current data
-    public function effect(callable $fn) : SQL { 
-        if (!empty($this->_data)) { $fn($this->_data); } return $this;
-    }
-    // set data to NULL if $fn returns false
-    public function if(callable $fn) : SQL {
-        if ($fn($this->_data) === false) { $this->_data = NULL; } return $this;
-    }
-    // set data to NULL if $fn returns true
-    public function if_not(callable $fn) : SQL {
-        if ($fn($this->_data) !== false) { $this->_data = NULL; } return $this;
-    }
-    // return true if we have an empty result set
-    public function empty() : bool {
-        return empty($this->_x);
-    } 
-    public function count() : int {
-        return is_array($this->_x) ? count($this->_x) : 0;
-    } 
-    // get all errors
-    public function errors() : array {
-        return $this->_errors;
-    }
-    // size of result set
-    public function size() : int {
-        return is_array($this->_x) ? count($this->_x) : ((empty($this->_x)) ? 0 : 1);
-    }
-    public function data() : ?array {
-        return $this->_x;
-    }
-    public function __toString() : string {
-        return (string)$this->_data;
-    }
-    */
-    public function close() {
-        if ($this->_mysqli_result) {
-            $this->_mysqli_result->free();
+    public function close(): void {
+        try {
+            if ($this->_mysqli_result) { $this->_mysqli_result->free(); }
+        } finally {
+            $this->_mysqli_result = null;
+            $this->_rows = null;
+            $this->_x = null;
+            $this->_len = 0;
+            $this->_position = 0;
         }
-        $this->_mysqli_result = null;
     }
 }
 

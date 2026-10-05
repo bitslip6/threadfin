@@ -3,7 +3,7 @@
 These are expected-behavior TinyTest tests, not tests that expect the current bugs.
 The initial baseline was **41 failed / 0 passed / 0 incomplete / 0 skipped**.
 The SQL-injection work expanded it to **44 failed / 0 passed** before the fix.
-The current suite has **170 tests: 170 passed / 0 failed**, exit 0, with no
+The current suite has **179 tests: 179 passed / 0 failed**, exit 0, with no
 incomplete cases, skips, or runner errors. Quoting, connection failure handling,
 the dump charset-statement terminator, current-row column lookup, complete
 buffered-result array conversion, associative duplicate updates, object
@@ -13,11 +13,12 @@ result map/reduce methods, dump byte budgets, requested-database selection,
 query simulation, null/missing template-parameter handling, NULL predicates,
 falsey `upsert_fn()` updates, buffered bulk inserts, non-duplicate error logging,
 replay recording/flush behavior, complete per-stream writes, and original SQL-text
-retention now pass. All reviewed regressions are fixed.
+retention now pass. Result-close/type hardening, replay append recovery and session
+envelopes, and obsolete-code cleanup also pass. All reviewed regressions are fixed.
 
 ## Current status
 
-Verified with the default TinyTest runner: **170 total, 170 passed, 0 failed**.
+Verified with the default TinyTest runner: **179 total, 179 passed, 0 failed**.
 There are **0 incomplete tests, 0 skipped tests, and 0 runner errors**, exit code 0.
 Counts below are test functions, not assertions or separate bugs.
 
@@ -31,6 +32,7 @@ Counts below are test functions, not assertions or separate bugs.
 | `test_db_dump.php` | 10 | 0 | 10 |
 | `test_db_duplicate_updates.php` | 4 | 0 | 4 |
 | `test_db_error_logging.php` | 7 | 0 | 7 |
+| `test_db_hardening.php` | 9 | 0 | 9 |
 | `test_db_regressions.php` | 46 | 0 | 46 |
 | `test_db_replay.php` | 7 | 0 | 7 |
 | `test_db_result_reads.php` | 9 | 0 | 9 |
@@ -42,18 +44,17 @@ Counts below are test functions, not assertions or separate bugs.
 | `test_db_transforms.php` | 10 | 0 | 10 |
 | `test_db_upsert.php` | 6 | 0 | 6 |
 | `test_db_where.php` | 5 | 0 | 5 |
-| **Total** | **170** | **0** | **170** |
+| **Total** | **179** | **0** | **179** |
 
 ### Remaining failures
 
-None in the default regression suite. The seven final replay, stream, and
-stored-SQL regressions now pass, alongside 17 new focused cases. The coverage
-table below records the reviewed issues, all now passing; broader integration
-limitations are still noted separately.
+None in the default regression suite. The original reviewed regressions and nine
+additional close/offset/replay/cleanup cases all pass. The coverage table below
+records the reviewed issues; integration limitations are noted separately.
 
-The opt-in live-server suite is separate from these totals. Its last verification
-was **3 passed, 0 failed** on disposable MariaDB 12.3.3; it was not rerun for this
-replay/stream/SQL-metadata fixes. See the integration section below.
+The opt-in live-server suites are separate from these totals: **7 passed, 0 failed**
+(3 quoting + 4 real-mysqli lifecycle tests), verified on a disposable MariaDB 12.3.3
+server for this hardening change. See the integration sections below.
 
 ## Running tests
 
@@ -75,6 +76,7 @@ php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_replay.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_simulation.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_duplicate_updates.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_error_logging.php
+php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_hardening.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_store.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_streams.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_sql_metadata.php
@@ -110,8 +112,8 @@ runs the CLI runner rather than executing mysqli stand-ins in the web process.
 - PHP 8.4+ implicit-nullable deprecations from existing `core.php` declarations
   are excluded in the child. Other diagnostics become reported exceptions.
 - Error/replay logs use unique temporary files and are deleted in `finally`.
-  The replay write-failure case uses an isolated in-memory stream wrapper, not
-  a SQL or replay implementation stand-in. No test writes the production
+  Replay write/flush-failure cases use an isolated in-memory stream wrapper with
+  seek/truncate behavior, not a SQL or replay implementation stand-in. No test writes the production
   `/tmp/php_sql_errors.log`.
 - The default suite consists of deterministic unit regressions. Its small
   literal lexer handles ordinary quoted strings and UTF-8 hex literals in both
@@ -258,8 +260,9 @@ also pass. No live-server tests were rerun for this change.
 
 `offsetExists()` now checks `0 <= offset < _len` using the cached length, excluding
 negative positions and the row count itself without calling `count()`. A separate
-backing-data check makes closed mysqli results report no available rows.
-Numeric-string offsets retain their existing support. Empty/null wrappers and
+backing-data check makes closed results report no available rows. Integer-string
+offsets retain support and now normalize consistently for reads and existence
+checks; floats/booleans and other types are rejected as described below. Empty/null wrappers and
 uninitialized results report no rows; buffered rows remain available after
 iterator exhaustion.
 
@@ -469,11 +472,11 @@ added, and existing return-mode semantics are unchanged.
 complete-write helper, then flushes before clearing the queue. Repeated close does
 not append it again; normal destructor closure still writes pending replay. Failed
 open/write/flush/lock operations report failure without consuming the queue, and
-locks/handles are released after a locked write attempt. A partial I/O failure can
-leave a partial file: inspect/repair it before retrying. This is not a crash-safe,
-transactional journal or an exactly-once database replication mechanism. Replay
-consumers must also supply suitable connection/session boundaries and settings;
-implicit rollback on connection closure is not an executed SQL statement here.
+locks/handles are released after a locked write attempt. Detected append/flush
+failures now truncate back to the checkpoint under the same lock before retry,
+as described below. This is not a crash-safe or exactly-once database replication
+mechanism; power loss/process termination and failed recovery still require
+operator attention.
 
 `test_db_replay.php` adds seven cases (five failed before the fix, two already
 passed); all seven now pass. They cover zero-affected statements and return modes,
@@ -513,6 +516,59 @@ array/null-backed metadata behavior is unchanged.
 passed); all three now pass, as does the original stored-SQL regression. No
 live-server tests were rerun for these final fixes; replay tests verify generated
 journal text and driver boundaries, not server-side transaction execution.
+
+## Result lifecycle, offset, replay, and cleanup hardening
+
+`SQL::close()` now releases both driver- and array-backed rows and clears cached
+length/current/cursor state, retaining only original SQL metadata. Repeated close
+is safe. Closed/uninitialized/empty results yield no rows; `current()` returns
+null instead of throwing a return-type error. Empty driver rewind avoids seeking
+a nonexistent row. `next()` keeps the historical position increments without
+reviving closed data. Read-only ArrayAccess mutators remain required interface
+methods, but explicitly report that results are read-only.
+
+Offsets accept integers and signed decimal integer strings, including leading
+zeros, without overflow. Floats (even `0.0`), booleans, null, whitespace, decimals,
+exponents, containers, and out-of-range strings do not coerce into row positions.
+Existence returns false; reads throw `OutOfBoundsException`, consistently for both
+backings and without cursor changes. `offsetExists()` still uses cached `_len`,
+never `count()`. Disconnected reads also retain interpolated SQL metadata.
+
+Replay captures initial SQL mode/autocommit at `enable_replay()`. Enable it on a
+fresh owned connection before application queries or transactions; already-open
+external transactions and arbitrary unrecorded session state cannot be reconstructed.
+One destination belongs to one DB session: re-enabling it is idempotent, while
+switching files throws `LogicException`. Invalid/unwritable paths throw exceptions
+instead of terminating the process; the library no longer echoes replay status.
+
+Each journal packet starts with rollback, utf8mb4, captured SQL mode/autocommit,
+and ends with rollback plus autocommit reset. This reproduces implicit rollback
+on close for pending transactions, including initial autocommit-off sessions,
+and prevents those transactions from leaking into later packets. SQL delimiters
+occupy their own lines so trailing line comments cannot swallow them. The importer
+selects the target database. Arbitrary user variables, temporary tables, procedures,
+SQL-dependent session state, and external connection activity are not a complete
+session-replication contract; the envelope restores the documented defaults.
+
+Replay uses a seekable/truncatable journal. Under the exclusive lock it checkpoints
+EOF, completes the append, and flushes before consuming the queue. On detected
+write/flush failure it truncates to that checkpoint and flushes recovery while
+still locked, then reports failure with the queue retained. If recovery itself
+fails, the exception explicitly requires journal repair before retry. Lock/handle
+cleanup runs in `finally`. This protects cooperating writers and retry after I/O
+failure, not machine-crash/power-loss atomicity.
+
+Removed obsolete commented-out SQL methods (`in_set`, `row`, `has_row`, `ondata`,
+`effect`, conditional/data/error/string helpers and duplicate count/empty bodies),
+dead `_data`, `_errors`, `_fetch_all`, `_err_filter_fn` fields, unused imports, and
+stale statement-building alternatives. The historical `SQL::from(fetch_all: ...)`
+argument remains accepted for compatibility; it no longer stores dead state.
+
+`test_db_hardening.php` adds nine cases, each demonstrated failing before its
+corresponding fix; all nine now pass. Four additional real-mysqli integration
+cases verify cursor/EOF/close behavior, multi-session replay and quoted bytes,
+301-row dump/restore with positive short writes and tiny budgets, and real factory
+setup/native query exceptions. See the live-server section below.
 
 ## Required connection and client-escaping contract
 
@@ -571,10 +627,46 @@ them at production. The server is not started or stopped by the test file.
 
 Verified on a newly initialized, socket-only MariaDB 12.3.3 instance: **3 passed,
 0 failed**, no runner errors. That temporary server/data directory was removed
-after the run. MySQL itself has not been exercised on this machine. This PHP
-installation lacks mysqli, so factory calls are verified with the stand-in; real
-server parsing/charset/mode behavior is exercised through the SQL CLI.
+after the run. MySQL itself has not been exercised on this machine. Quoting tests
+use the SQL CLI. mysqli is not enabled in the default PHP configuration, but the
+installed module is explicitly loaded only in isolated lifecycle-test children.
 
-A passing regression is not proof of full database correctness. Broader live-server
-dump/restore, replay execution, transaction/session lifecycle, and real-mysqli
-integration still need coverage beyond these deterministic unit regressions.
+## Opt-in real-mysqli lifecycle tests
+
+`integration/test_db_mysql_lifecycle.php` contains four additional tests using
+real production `db.php` and real mysqli, not the stand-in. They verify:
+
+- Native buffered cursors, normalized random offsets, EOF restoration, empty and
+  closed results, charset/mode configuration.
+- Executing a shared journal from multiple connections, initial autocommit-off and
+  explicit uncommitted transactions, committed/savepoint data, UTF-8/quoted bytes,
+  importer mode/autocommit defaults, trailing SQL comments, and repeated close.
+- Actual 301-row dump/restore with NULL/zero/numeric text and binary-safe quoting,
+  300-row checkpoints, real positive short writes, and tiny byte-budget stopping.
+- `DB::connect()` and native mysqli exceptions through write/read/close paths.
+
+These tests require an **EMPTY disposable database**, socket authentication with
+no password, and explicit permission for schema changes. They create randomly
+named ordinary tables, drop them in cleanup, and reject nonempty databases before
+changing anything. Never point them at production. As with the quoting suite,
+tests do not start/stop the database server themselves.
+
+```sh
+THREADFIN_TEST_MYSQL_SOCKET=/path/to/disposable/server.sock \
+THREADFIN_TEST_MYSQL_DATABASE=threadfin_lifecycle_tests \
+THREADFIN_TEST_MYSQL_ALLOW_SCHEMA_CHANGES=1 \
+php /home/cory/Work/tinytest/tinytest.php -j \
+  -f tests/integration/test_db_mysql_lifecycle.php
+```
+
+`THREADFIN_TEST_MYSQL_USER` defaults to `root`. `THREADFIN_TEST_PHP` selects the
+child PHP CLI; `THREADFIN_TEST_MYSQLI_EXTENSION` selects a module name/absolute path
+(default `mysqli`). Children use `php -n -d extension=...`; the host process never
+loads the stand-in or real mysqli module on behalf of tests.
+
+Verified on a fresh socket-only MariaDB 12.3.3 server with PHP 8.5.10/mysqlnd:
+**4 lifecycle + 3 quoting tests passed, 0 failed**, no runner errors. The temporary
+server/data directory was shut down and removed after verification. MySQL itself,
+crash/power-loss recovery, nontransactional engines, arbitrary SQL/session state,
+and concurrent journal-reader behavior still warrant broader integration testing.
+A green regression suite is not a proof of complete database correctness.

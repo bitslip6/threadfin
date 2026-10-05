@@ -1,4 +1,12 @@
 <?php declare(strict_types=1);
+/** Expected journal envelope for the isolated driver's configured session. */
+function db_expected_replay_packet(array $sqls, int $autocommit = 1): string {
+    return "\n-- ThreadFin replay session\nROLLBACK;\nSET NAMES utf8mb4;\n"
+        . "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,ANSI_QUOTES,NO_ENGINE_SUBSTITUTION';\n"
+        . "SET SESSION autocommit = $autocommit;\n"
+        . implode("\n;\n", $sqls) . "\n;\nROLLBACK;\nSET SESSION autocommit = 1;\n-- End ThreadFin replay session\n";
+}
+
 /** TinyTest assertions stay in the host; mysqli stand-ins stay in child processes. */
 function db_regression_observe(string $case, bool $nativeAssertions = true): mixed {
     $php = getenv('THREADFIN_TEST_PHP') ?: (PHP_SAPI === 'cli' ? PHP_BINARY : '/usr/bin/php');
