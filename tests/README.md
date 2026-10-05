@@ -3,7 +3,7 @@
 These are expected-behavior TinyTest tests, not tests that expect the current bugs.
 The initial baseline was **41 failed / 0 passed / 0 incomplete / 0 skipped**.
 The SQL-injection work expanded it to **44 failed / 0 passed** before the fix.
-The current suite has **153 tests: 146 passed / 7 failed**, exit 1, with no
+The current suite has **170 tests: 170 passed / 0 failed**, exit 0, with no
 incomplete cases, skips, or runner errors. Quoting, connection failure handling,
 the dump charset-statement terminator, current-row column lookup, complete
 buffered-result array conversion, associative duplicate updates, object
@@ -11,15 +11,15 @@ store/attribute mapping, cursor synchronization, invalid array-read rejection,
 array-backed result operations, row-offset existence bounds, the dumper's
 result map/reduce methods, dump byte budgets, requested-database selection,
 query simulation, null/missing template-parameter handling, NULL predicates,
-falsey `upsert_fn()` updates, buffered bulk inserts, and non-duplicate error
-logging now pass. Other reviewed bugs remain unfixed.
+falsey `upsert_fn()` updates, buffered bulk inserts, non-duplicate error logging,
+replay recording/flush behavior, complete per-stream writes, and original SQL-text
+retention now pass. All reviewed regressions are fixed.
 
 ## Current status
 
-Verified with the default TinyTest runner: **153 total, 146 passed, 7 failed**.
-There are **0 incomplete tests, 0 skipped tests, and 0 runner errors**. Exit code
-1 comes from the outstanding regressions, not a runner/setup failure. Counts below
-are test functions, not assertions or separate bugs.
+Verified with the default TinyTest runner: **170 total, 170 passed, 0 failed**.
+There are **0 incomplete tests, 0 skipped tests, and 0 runner errors**, exit code 0.
+Counts below are test functions, not assertions or separate bugs.
 
 | Test file | Passed | Failed | Total |
 | --- | ---: | ---: | ---: |
@@ -31,32 +31,29 @@ are test functions, not assertions or separate bugs.
 | `test_db_dump.php` | 10 | 0 | 10 |
 | `test_db_duplicate_updates.php` | 4 | 0 | 4 |
 | `test_db_error_logging.php` | 7 | 0 | 7 |
-| `test_db_regressions.php` | 39 | 7 | 46 |
+| `test_db_regressions.php` | 46 | 0 | 46 |
+| `test_db_replay.php` | 7 | 0 | 7 |
 | `test_db_result_reads.php` | 9 | 0 | 9 |
 | `test_db_simulation.php` | 8 | 0 | 8 |
+| `test_db_sql_metadata.php` | 3 | 0 | 3 |
 | `test_db_store.php` | 6 | 0 | 6 |
+| `test_db_streams.php` | 7 | 0 | 7 |
 | `test_db_templates.php` | 8 | 0 | 8 |
 | `test_db_transforms.php` | 10 | 0 | 10 |
 | `test_db_upsert.php` | 6 | 0 | 6 |
 | `test_db_where.php` | 5 | 0 | 5 |
-| **Total** | **146** | **7** | **153** |
+| **Total** | **170** | **0** | **170** |
 
 ### Remaining failures
 
-All 7 failing functions are in `test_db_regressions.php`. The names below omit
-only the common **`test_db_`** prefix. This is the current fix backlog; the broader
-coverage table below includes both fixed and outstanding regressions.
-
-| Outstanding issue | Failing test suffixes | Count |
-| --- | --- | ---: |
-| Replay loses DDL/rollback semantics and duplicates on close | `replay_records_successful_ddl`, `replay_does_not_commit_rolled_back_writes`, `repeated_close_does_not_duplicate_replay` | 3 |
-| Stream falsey strings, short writes, cross-stream totals | `stream_writes_literal_zero`, `stream_retries_short_writes`, `stream_byte_totals_are_per_stream` | 3 |
-| Stored SQL text replaced by result wrapper | `result_retains_original_sql_text` | 1 |
-| **Total** | | **7** |
+None in the default regression suite. The seven final replay, stream, and
+stored-SQL regressions now pass, alongside 17 new focused cases. The coverage
+table below records the reviewed issues, all now passing; broader integration
+limitations are still noted separately.
 
 The opt-in live-server suite is separate from these totals. Its last verification
 was **3 passed, 0 failed** on disposable MariaDB 12.3.3; it was not rerun for this
-non-duplicate error-logging fix. See the integration section below.
+replay/stream/SQL-metadata fixes. See the integration section below.
 
 ## Running tests
 
@@ -74,10 +71,13 @@ php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_connection.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_cursor.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_dump.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_result_reads.php
+php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_replay.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_simulation.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_duplicate_updates.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_error_logging.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_store.php
+php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_streams.php
+php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_sql_metadata.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_templates.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_transforms.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_upsert.php
@@ -93,8 +93,9 @@ runs the CLI runner rather than executing mysqli stand-ins in the web process.
 
 ## Isolation and requirements
 
-- PHP 8.1+ CLI, `proc_open`, and writable temporary storage; no database server,
-  mysqli extension, network access, or Composer dependencies are required.
+- PHP 8.1+ CLI, `proc_open`, writable temporary storage, and zlib available in
+  `php -n` for the gzip round-trip test; no database server, mysqli extension,
+  network access, or Composer dependencies are required.
 - Each test observation runs in a fresh `php -n` child. `tests/support/mysqli.php`
   supplies the driver's boundary only: result cursor operations, affected-row
   counts, connection exceptions, and canned responses. Real `db.php` executes.
@@ -109,7 +110,9 @@ runs the CLI runner rather than executing mysqli stand-ins in the web process.
 - PHP 8.4+ implicit-nullable deprecations from existing `core.php` declarations
   are excluded in the child. Other diagnostics become reported exceptions.
 - Error/replay logs use unique temporary files and are deleted in `finally`.
-  No test writes the production `/tmp/php_sql_errors.log`.
+  The replay write-failure case uses an isolated in-memory stream wrapper, not
+  a SQL or replay implementation stand-in. No test writes the production
+  `/tmp/php_sql_errors.log`.
 - The default suite consists of deterministic unit regressions. Its small
   literal lexer handles ordinary quoted strings and UTF-8 hex literals in both
   backslash modes; it does not pretend to execute SQL. Separate opt-in real-server
@@ -166,9 +169,10 @@ All function names below have the `test_db_` prefix.
 - Missing template keys must raise `InvalidArgumentException` or
   `OutOfBoundsException`; out-of-range row reads must raise `OutOfBoundsException`
   or `ValueError`. Simulation must log generated SQL without executing it or
-  recording false errors. Dump budgets include headers. Replay may preserve
-  rollback boundaries in order or omit rolled-back writes. Byte totals belong
-  to individual streams. These explicit contracts avoid asserting current bugs.
+  recording false errors. Dump budgets include headers. Replay preserves executed
+  transaction boundaries in order rather than filtering rolled-back statements.
+  Byte totals belong to individual streams. These explicit contracts avoid
+  asserting current bugs.
 
 ## Associative duplicate-update fixes
 
@@ -306,8 +310,9 @@ queries. `dump_table()` now checks header/DDL writes as well as row-batch writes
 Only successful complete batches advance row checkpoints; interrupted tables
 retain the last written row offset, and unvisited tables receive incomplete zero
 offsets. Every table still has an `Offset` entry. These offsets are progress
-markers, not a newly implemented resumable-dump API. Generic writer short-write
-handling and the separate stream regressions remain outstanding.
+markers, not a newly implemented resumable-dump API. The shared stream helpers now
+complete positive short writes as described below; arbitrary dump callbacks remain
+responsible for honoring their complete-chunk output contract.
 
 `test_db_dump.php` adds ten cases (nine failed before the fix, one already passed);
 all ten now pass. Coverage includes header/DDL/batch boundaries, multi-table
@@ -439,7 +444,8 @@ all errors are duplicates. Existing file contents, `print_r` formatting, array
 keys/order, and the complete public `errors` list are preserved. A false
 `SQL_ERROR_FILE` still disables file output without preventing handle closure.
 Explicit close can log setup errors even when factory cleanup already disconnected
-the wrapper. Replay handling and repeated-close semantics are unchanged here.
+the wrapper. This error-logging fix did not alter replay; its separate fixes are
+described below. Repeated-close error-log behavior remains unchanged.
 
 `test_db_error_logging.php` adds seven cases (five failed before the fix, two
 already passed); all seven now pass. They cover mixed/duplicate-only diagnostics,
@@ -447,6 +453,66 @@ uncoded and falsey text, public write/read failures through both driver failure
 modes, multiline SQL, connection-setup errors, empty logs, and disabled output.
 The original non-duplicate logging regression also passes. All file output uses
 isolated temporary paths (or is disabled); no live-server tests were rerun.
+
+## Replay recording and flush fixes
+
+Replay now records every successfully executed statement through the write/raw
+`_qb()` path, independent of affected rows and requested return mode. This includes
+DDL, no-op writes, session settings, and transaction controls. `BEGIN`/`START
+TRANSACTION`, savepoints, rollback, and commit remain in execution order; replay
+no longer converts explicit rolled-back inserts into standalone committed writes.
+Ordinary `fetch()` reads, query failures, and all simulated statements stay out
+of the queue. Replay remains opt-in; no SQL parsing or transaction emulation is
+added, and existing return-mode semantics are unchanged.
+
+`close()` appends the complete queued journal under the file lock using the shared
+complete-write helper, then flushes before clearing the queue. Repeated close does
+not append it again; normal destructor closure still writes pending replay. Failed
+open/write/flush/lock operations report failure without consuming the queue, and
+locks/handles are released after a locked write attempt. A partial I/O failure can
+leave a partial file: inspect/repair it before retrying. This is not a crash-safe,
+transactional journal or an exactly-once database replication mechanism. Replay
+consumers must also supply suitable connection/session boundaries and settings;
+implicit rollback on connection closure is not an executed SQL statement here.
+
+`test_db_replay.php` adds seven cases (five failed before the fix, two already
+passed); all seven now pass. They cover zero-affected statements and return modes,
+transaction/savepoint ordering, exclusion paths, repeated close, destructor and
+disabled behavior, and zero-progress write failure followed by explicit retry.
+The three original replay regressions also pass.
+
+## Complete per-stream writing fixes
+
+`stream_output_fn()` now writes nonempty `'0'` and binary/UTF-8 data, looping over
+only the remaining suffix after each positive short write. Null/empty chunks do
+not call the writer; they return that handle's current cumulative byte total.
+Totals are keyed by resource ID rather than shared across streams, without keeping
+strong resource references that would prevent automatic closure.
+
+Writer callbacks must report integer byte counts. False, zero, negative,
+non-integer, or oversized reports return `-1` without inventing progress or
+looping indefinitely. Successfully written prefixes remain counted even when a
+later callback fails or throws; exceptions still propagate. Callers must account
+for partial output rather than blindly resending a failed chunk. `gz_output_fn()`
+uses the same loop and tracks uncompressed input bytes for its own handle.
+
+`test_db_streams.php` adds seven cases; all seven failed before the fix and now
+pass. They cover zero/binary text, empty calls, exact retry suffixes, interleaved
+totals, failure/invalid reports, exception progress, and actual gzip round trips.
+The three original stream regressions also pass.
+
+## Original SQL-text retention fix
+
+`SQL::fetch()` no longer shadows its SQL argument with the result wrapper. Its
+`_sql` field retains the exact input text for empty and nonempty driver results,
+including after array conversion, cursor movement, and close. Public successful,
+failed, and simulated reads retain the generated/interpolated SQL. Existing
+array/null-backed metadata behavior is unchanged.
+
+`test_db_sql_metadata.php` adds three cases (two failed before the fix, one already
+passed); all three now pass, as does the original stored-SQL regression. No
+live-server tests were rerun for these final fixes; replay tests verify generated
+journal text and driver boundaries, not server-side transaction execution.
 
 ## Required connection and client-escaping contract
 
@@ -509,6 +575,6 @@ after the run. MySQL itself has not been exercised on this machine. This PHP
 installation lacks mysqli, so factory calls are verified with the stand-in; real
 server parsing/charset/mode behavior is exercised through the SQL CLI.
 
-A passing regression is not proof of full database correctness. Dump/restore,
-transactions, and broader driver integration still need coverage during their
-respective production fixes.
+A passing regression is not proof of full database correctness. Broader live-server
+dump/restore, replay execution, transaction/session lifecycle, and real-mysqli
+integration still need coverage beyond these deterministic unit regressions.

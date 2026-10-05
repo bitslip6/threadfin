@@ -43,6 +43,23 @@ class DbStatementProbe extends DB {
     }
 }
 
+/** Filesystem boundary only: force a zero-progress replay write, then allow retry. */
+class DbReplayWriteFixture {
+    public $context;
+    public static bool $blocked = true;
+    public static string $contents = '';
+    public function url_stat($path, $flags): array { return ['mode' => 0100666, 'size' => strlen(self::$contents)]; }
+    public function stream_open($path, $mode, $options, &$openedPath): bool { return true; }
+    public function stream_lock($operation): bool { return true; }
+    public function stream_write($data): int {
+        if (self::$blocked) { return 0; }
+        self::$contents .= $data;
+        return strlen($data);
+    }
+    public function stream_flush(): bool { return true; }
+    public function stream_close(): void {}
+}
+
 /** Isolate attribute extraction from downstream SQL generation and execution. */
 class DbAttributeProbe extends DbStatementProbe {
     public array $extracted = [];
@@ -1207,6 +1224,83 @@ function db_fixture_run(string $case): mixed {
             $db->errors[] = '[BAD SQL] errno(1064) Syntax error near BAD';
             $db->close();
             return [SQL_ERROR_FILE, $handle->closed, $db->errors, count($GLOBALS['fixtureFiles'])];
+        case 'replay_zero_affected_and_modes':
+            $path = db_fixture_file();
+            $db = DB::from(new mysqli())->enable_replay($path);
+            $sqls = ['CREATE TABLE records (id INT)', 'UPDATE records SET id = 1 WHERE id = 1',
+                'SET autocommit = 1', 'ALTER TABLE records ADD name TEXT', 'INSERT INTO records VALUES (1)'];
+            $modes = [DB_FETCH_SUCCESS, \ThreadFin\DB\DB_FETCH_NUM_ROWS, DB_FETCH_SUCCESS,
+                \ThreadFin\DB\DB_FETCH_INSERT_ID, \ThreadFin\DB\DB_FETCH_INSERT_ID];
+            $statuses = [];
+            foreach ($sqls as $index => $sql) { $statuses[] = $db->unsafe_raw($sql, $modes[$index]); }
+            $pending = db_fixture_property($db, '_replay');
+            $db->close();
+            return [$statuses, $pending, file_get_contents($path), db_fixture_property($db, '_replay'), $db->errors];
+        case 'replay_transaction_sequences':
+            $observations = [];
+            foreach ([['BEGIN', 'INSERT INTO records VALUES (1)', 'ROLLBACK'],
+                      ['START TRANSACTION', 'INSERT INTO records VALUES (2)', 'SAVEPOINT checkpoint',
+                       'INSERT INTO records VALUES (3)', 'ROLLBACK TO SAVEPOINT checkpoint', 'COMMIT']] as $sqls) {
+                $path = db_fixture_file();
+                $db = DB::from(new mysqli())->enable_replay($path);
+                foreach ($sqls as $sql) { $db->unsafe_raw($sql); }
+                $db->close();
+                $observations[] = file_get_contents($path);
+            }
+            return $observations;
+        case 'replay_excludes_failures_reads_and_simulation':
+            $path = db_fixture_file();
+            $db = DB::from(new mysqli())->enable_replay($path);
+            $GLOBALS['db_fixture_query_failures'] = ['BAD FALSE' => 'false', 'BAD EXCEPTION' => 'exception'];
+            $db->unsafe_raw('BAD FALSE');
+            $db->unsafe_raw('CREATE TABLE records (id INT)');
+            $db->fetch('SELECT id FROM records');
+            $db->enable_simulation(true)->unsafe_raw('INSERT INTO records VALUES (99)');
+            $db->unsafe_raw('BEGIN');
+            $db->enable_simulation(false)->unsafe_raw('BAD EXCEPTION');
+            unset($GLOBALS['db_fixture_query_failures']);
+            $db->close();
+            return [file_get_contents($path), count($db->errors), db_fixture_property($db, '_replay')];
+        case 'replay_append_once':
+            $path = db_fixture_file();
+            file_put_contents($path, "# prior journal\n");
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_replay($path);
+            $db->unsafe_raw('INSERT INTO records VALUES (1)');
+            $db->close();
+            $first = file_get_contents($path);
+            $pending = db_fixture_property($db, '_replay');
+            $db->close();
+            return [$first, file_get_contents($path), $pending, $handle->closed];
+        case 'replay_destructor':
+            $path = db_fixture_file();
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_replay($path);
+            $db->unsafe_raw('INSERT INTO records VALUES (1)');
+            unset($db);
+            return [file_get_contents($path), $handle->closed];
+        case 'replay_disabled':
+            $path = db_fixture_file();
+            $db = DB::from(new mysqli());
+            $db->unsafe_raw('CREATE TABLE records (id INT)');
+            $db->unsafe_raw('INSERT INTO records VALUES (1)');
+            $db->close();
+            return [file_get_contents($path), db_fixture_property($db, '_replay')];
+        case 'replay_failed_write_retry':
+            stream_wrapper_register('dbreplaytest', DbReplayWriteFixture::class);
+            try {
+                $handle = new mysqli();
+                $db = DB::from($handle)->enable_replay('dbreplaytest://journal');
+                $db->unsafe_raw('INSERT INTO records VALUES (1)');
+                try { $db->close(); $rejected = false; }
+                catch (RuntimeException $error) { $rejected = true; }
+                $pending = db_fixture_property($db, '_replay');
+                DbReplayWriteFixture::$blocked = false;
+                $db->close();
+                $db->close();
+                return [$rejected, $pending, db_fixture_property($db, '_replay'),
+                    DbReplayWriteFixture::$contents, $handle->closed];
+            } finally { stream_wrapper_unregister('dbreplaytest'); }
         case 'replay_ddl':
             $path = db_fixture_file();
             $db = DB::from(new mysqli())->enable_replay($path);
@@ -1231,6 +1325,87 @@ function db_fixture_run(string $case): mixed {
             $db->close();
             $db->close();
             return substr_count(file_get_contents($path), 'INSERT INTO records VALUES (1)');
+        case 'stream_binary_and_empty':
+            $stream = fopen('php://memory', 'w+');
+            try {
+                $statuses = [stream_output_fn(null, $stream), stream_output_fn('', $stream),
+                    stream_output_fn('0', $stream), stream_output_fn("é\0Z", $stream),
+                    stream_output_fn(null, $stream), stream_output_fn('', $stream)];
+                rewind($stream);
+                return [$statuses, stream_get_contents($stream)];
+            } finally { fclose($stream); }
+        case 'stream_short_write_suffixes':
+            $stream = fopen('php://memory', 'w+');
+            try {
+                $calls = [];
+                $total = stream_output_fn('abcdef', $stream, function($s, $data) use (&$calls) {
+                    $calls[] = $data;
+                    return fwrite($s, substr($data, 0, 2));
+                });
+                rewind($stream);
+                return [$total, $calls, stream_get_contents($stream)];
+            } finally { fclose($stream); }
+        case 'stream_interleaved_totals':
+            $first = fopen('php://memory', 'w+');
+            $second = fopen('php://memory', 'w+');
+            try {
+                return [stream_output_fn('ab', $first), stream_output_fn('0', $second),
+                    stream_output_fn('c', $first), stream_output_fn(null, $second),
+                    stream_output_fn('', $first)];
+            } finally { fclose($first); fclose($second); }
+        case 'stream_partial_failures':
+            $observations = [];
+            foreach ([false, 0, -1] as $failure) {
+                $stream = fopen('php://memory', 'w+');
+                try {
+                    stream_output_fn('ab', $stream);
+                    $calls = 0;
+                    $status = stream_output_fn('cdef', $stream, function($s, $data) use (&$calls, $failure) {
+                        return ++$calls === 1 ? fwrite($s, substr($data, 0, 2)) : $failure;
+                    });
+                    $progress = stream_output_fn(null, $stream);
+                    $retry = stream_output_fn('ef', $stream);
+                    rewind($stream);
+                    $observations[] = [$status, $progress, $retry, $calls, stream_get_contents($stream)];
+                } finally { fclose($stream); }
+            }
+            return $observations;
+        case 'stream_invalid_writer_counts':
+            $observations = [];
+            foreach ([true, 1.5, '1', 99] as $invalid) {
+                $stream = fopen('php://memory', 'w+');
+                try {
+                    $observations[] = [stream_output_fn('abc', $stream, fn($s, $data) => $invalid),
+                        stream_output_fn(null, $stream)];
+                } finally { fclose($stream); }
+            }
+            return $observations;
+        case 'stream_writer_exception':
+            $stream = fopen('php://memory', 'w+');
+            try {
+                $calls = 0;
+                try {
+                    stream_output_fn('abcd', $stream, function($s, $data) use (&$calls) {
+                        if (++$calls === 2) { throw new RuntimeException('writer rejected'); }
+                        return fwrite($s, substr($data, 0, 2));
+                    });
+                    $rejected = false;
+                } catch (RuntimeException $error) { $rejected = $error->getMessage() === 'writer rejected'; }
+                $progress = stream_output_fn(null, $stream);
+                rewind($stream);
+                return [$rejected, $progress, stream_get_contents($stream)];
+            } finally { fclose($stream); }
+        case 'stream_gzip_round_trip':
+            $plain = fopen('php://memory', 'w+');
+            stream_output_fn('unrelated', $plain);
+            fclose($plain);
+            $path = db_fixture_file();
+            $stream = gzopen($path, 'wb');
+            try {
+                $statuses = [\ThreadFin\DB\gz_output_fn('0', $stream),
+                    \ThreadFin\DB\gz_output_fn("é\0Z", $stream), \ThreadFin\DB\gz_output_fn(null, $stream)];
+            } finally { gzclose($stream); }
+            return [$statuses, gzdecode(file_get_contents($path))];
         case 'stream_zero':
             $stream = fopen('php://memory', 'w+');
             try {
@@ -1260,6 +1435,38 @@ function db_fixture_run(string $case): mixed {
         case 'connection_failure':
             $GLOBALS['db_fixture_connection_failure'] = true;
             return DB::connect('host', 'user', 'pass', 'configured')->connected();
+        case 'stored_sql_driver_lifecycle':
+            $text = "SELECT '0';\n-- déjà vu";
+            $observations = [];
+            foreach ([[], [['id' => '1']]] as $rows) {
+                $result = SQL::fetch(new mysqli_result($rows), $text);
+                $before = db_fixture_property($result, '_sql');
+                $snapshot = $result->as_array();
+                if ($rows) { $result->seek(0); $result->next(); }
+                $result->close();
+                $observations[] = [$before, $snapshot, db_fixture_property($result, '_sql')];
+            }
+            return $observations;
+        case 'stored_sql_array_lifecycle':
+            $text = "SELECT '0'\0\n-- metadata";
+            $observations = [];
+            foreach ([null, [], [['id' => '1']]] as $rows) {
+                $result = SQL::from($rows, $text);
+                $result->as_array();
+                $result->close();
+                $observations[] = db_fixture_property($result, '_sql');
+            }
+            return $observations;
+        case 'stored_sql_public_paths':
+            $db = DB::from(new mysqli());
+            $success = $db->fetch('SELECT name FROM records WHERE name = {name}', ['name' => "O'Reilly"]);
+            $GLOBALS['db_fixture_query_failures'] = ['SELECT bad' => 'false'];
+            $failure = $db->fetch('SELECT bad');
+            unset($GLOBALS['db_fixture_query_failures']);
+            $simulated = $db->enable_simulation(true)->fetch('SELECT {zero}', ['zero' => 0]);
+            $db->close();
+            return array_map(fn($result) => [db_fixture_property($result, '_sql'), count($result)],
+                [$success, $failure, $simulated]);
         case 'stored_sql':
             $stored = db_fixture_property(db_fixture_result(), '_sql');
             return is_string($stored) ? $stored : get_debug_type($stored);

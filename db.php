@@ -339,7 +339,8 @@ class DB {
                     $msg = "# [$sql] errno($errno) affected rows($affected)";
                     $this->logs[] = $msg;
                 }
-                if ($this->_replay_enabled && $affected > 0) {
+                // Successful DDL, no-op writes, and transaction controls also belong in replay.
+                if ($this->_replay_enabled) {
                     $this->_replay[] = $sql;
                 }
             }
@@ -754,24 +755,33 @@ class DB {
                 die("refusing to write replay log to: ". $this->_replay_file);
             }
         }
-        if (count($this->_replay) >= 1) { 
+        if (count($this->_replay) >= 1) {
             $attempts = 10;
             while ($attempts-- > 0) {
                 echo "writing replay log to: ". $this->_replay_file . "\n";
                 $fp = fopen($this->_replay_file, "a+");
-                if (flock($fp, LOCK_EX)) {  // acquire an exclusive lock
-                    fwrite($fp, "\n".implode(";\n", $this->_replay).";\n");
-                    fflush($fp);            // flush output before releasing the lock
-                    flock($fp, LOCK_UN);    // release the lock
-                    fclose($fp);
-                    $attempts = -1;
-                } else {
-                    fclose($fp);
-                    sleep(1);
-                    echo "!!!! PANIC !!!! Couldn't get the lock for replay file!\n";
+                if ($fp === false) {
+                    throw new RuntimeException('Unable to open replay log: ' . $this->_replay_file);
                 }
+                if (flock($fp, LOCK_EX)) {
+                    try {
+                        $chunk = "\n" . implode(";\n", $this->_replay) . ";\n";
+                        if (stream_output_fn($chunk, $fp) < 0 || !fflush($fp)) {
+                            throw new RuntimeException('Unable to write replay log: ' . $this->_replay_file);
+                        }
+                        // Consume only after the complete journal has been written and flushed.
+                        $this->_replay = [];
+                    } finally {
+                        flock($fp, LOCK_UN);
+                        fclose($fp);
+                    }
+                    return;
+                }
+                fclose($fp);
+                sleep(1);
+                echo "!!!! PANIC !!!! Couldn't get the lock for replay file!\n";
             }
-            //file_put_contents($this->_replay_file, "\n".implode(";\n", $this->logs).";\n", FILE_APPEND);
+            throw new RuntimeException('Unable to lock replay log: ' . $this->_replay_file);
         }
     }
 }
@@ -882,12 +892,12 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable {
     }
 
     public static function fetch(mysqli_result $result, string $sql) : SQL {
-        $sql = new SQL();
-        $sql->_mysqli_result = $result;
-        $sql->_sql = $sql;
-        $sql->_x = $result->fetch_assoc();
-        $sql->_len = $result->num_rows;
-        return $sql;
+        $wrapper = new SQL();
+        $wrapper->_mysqli_result = $result;
+        $wrapper->_sql = $sql;
+        $wrapper->_x = $result->fetch_assoc();
+        $wrapper->_len = $result->num_rows;
+        return $wrapper;
     }
 
     
@@ -1094,23 +1104,30 @@ function gz_output_fn(?string $data, $stream) : int {
 }
 
 /**
- * function suitable for database dumping to gz compressed output file
- * @param string $data 
- * @param mixed $stream 
- * @return int -1 on error, else total byte length written to stream across all writes
+ * Write a complete dump chunk, retrying positive short writes.
+ * @param ?string $data null/empty chunks query the current total without writing
+ * @param mixed $stream an open stream resource
+ * @param callable $fn writer returning an integer byte count or false
+ * @return int -1 on failed/invalid progress, else cumulative bytes for this handle
+ *             (successful prefixes remain counted if a later write fails)
  */
 function stream_output_fn(?string $data, $stream, $fn = "fwrite") : int {
     assert(is_resource($stream), "stream must be a resource");
-    static $total_bytes = 0;
-
-    if ($data && strlen($data) > 0) {
-        $bytes = $fn($stream, $data);
-        if (!$bytes) {
+    // Resource IDs separate handles without retaining resources and preventing closure.
+    static $total_bytes = [];
+    $id = get_resource_id($stream);
+    $total_bytes[$id] ??= 0;
+    $length = strlen($data ?? '');
+    $offset = 0;
+    while ($offset < $length) {
+        $bytes = $fn($stream, substr($data, $offset));
+        if (!is_int($bytes) || $bytes <= 0 || $bytes > $length - $offset) {
             return -1;
         }
-        $total_bytes += $bytes;
+        $offset += $bytes;
+        $total_bytes[$id] += $bytes;
     }
-    return $total_bytes;
+    return $total_bytes[$id];
 }
 
 
