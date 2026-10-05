@@ -35,7 +35,8 @@ function test_db_mysql_replay_restores_session_defaults_and_preserves_commits_an
     $observed = db_mysql_lifecycle_observe('replay');
     assert_eq(array_column($observed[0], 'id'), ['3', '4'], 'Source connection close must roll back pending writes; committed IDs survive');
     assert_eq($observed[1], $observed[0], 'Replaying multiple sessions must exactly reproduce committed rows and quoted bytes');
-    assert_eq(array_slice($observed, 2), ['1', true], 'Replay must leave no pending transaction/autocommit state and repeated close must append nothing');
+    assert_eq(array_slice($observed, 2), ['1', true, 0],
+        'Replay must restore autocommit, append once, and execute no inspection/write queries during simulation');
 }
 
 /** @type integration */

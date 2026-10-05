@@ -3,7 +3,7 @@
 These are expected-behavior TinyTest tests, not tests that expect the current bugs.
 The initial baseline was **41 failed / 0 passed / 0 incomplete / 0 skipped**.
 The SQL-injection work expanded it to **44 failed / 0 passed** before the fix.
-The current suite has **179 tests: 179 passed / 0 failed**, exit 0, with no
+The current suite has **186 tests: 186 passed / 0 failed**, exit 0, with no
 incomplete cases, skips, or runner errors. Quoting, connection failure handling,
 the dump charset-statement terminator, current-row column lookup, complete
 buffered-result array conversion, associative duplicate updates, object
@@ -14,11 +14,12 @@ query simulation, null/missing template-parameter handling, NULL predicates,
 falsey `upsert_fn()` updates, buffered bulk inserts, non-duplicate error logging,
 replay recording/flush behavior, complete per-stream writes, and original SQL-text
 retention now pass. Result-close/type hardening, replay append recovery and session
-envelopes, and obsolete-code cleanup also pass. All reviewed regressions are fixed.
+envelopes, obsolete-code cleanup, idempotent error-log closure, and simulation-safe
+replay initialization also pass. All reviewed regressions are fixed.
 
 ## Current status
 
-Verified with the default TinyTest runner: **179 total, 179 passed, 0 failed**.
+Verified with the default TinyTest runner: **186 total, 186 passed, 0 failed**.
 There are **0 incomplete tests, 0 skipped tests, and 0 runner errors**, exit code 0.
 Counts below are test functions, not assertions or separate bugs.
 
@@ -27,6 +28,7 @@ Counts below are test functions, not assertions or separate bugs.
 | `test_db_array_results.php` | 8 | 0 | 8 |
 | `test_db_bounds.php` | 5 | 0 | 5 |
 | `test_db_bulk.php` | 9 | 0 | 9 |
+| `test_db_close_simulation.php` | 7 | 0 | 7 |
 | `test_db_connection.php` | 5 | 0 | 5 |
 | `test_db_cursor.php` | 7 | 0 | 7 |
 | `test_db_dump.php` | 10 | 0 | 10 |
@@ -44,17 +46,17 @@ Counts below are test functions, not assertions or separate bugs.
 | `test_db_transforms.php` | 10 | 0 | 10 |
 | `test_db_upsert.php` | 6 | 0 | 6 |
 | `test_db_where.php` | 5 | 0 | 5 |
-| **Total** | **179** | **0** | **179** |
+| **Total** | **186** | **0** | **186** |
 
 ### Remaining failures
 
-None in the default regression suite. The original reviewed regressions and nine
-additional close/offset/replay/cleanup cases all pass. The coverage table below
+None in the default regression suite. The original reviewed regressions, nine
+close/offset/replay/cleanup cases, and seven close/simulation ordering cases pass. The coverage table below
 records the reviewed issues; integration limitations are noted separately.
 
 The opt-in live-server suites are separate from these totals: **7 passed, 0 failed**
 (3 quoting + 4 real-mysqli lifecycle tests), verified on a disposable MariaDB 12.3.3
-server for this hardening change. See the integration sections below.
+server for these close/simulation fixes. See the integration sections below.
 
 ## Running tests
 
@@ -68,6 +70,7 @@ php /home/cory/Work/tinytest/tinytest.php -v -f tests/test_db_regressions.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_array_results.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_bounds.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_bulk.php
+php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_close_simulation.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_connection.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_cursor.php
 php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_dump.php
@@ -448,7 +451,8 @@ keys/order, and the complete public `errors` list are preserved. A false
 `SQL_ERROR_FILE` still disables file output without preventing handle closure.
 Explicit close can log setup errors even when factory cleanup already disconnected
 the wrapper. This error-logging fix did not alter replay; its separate fixes are
-described below. Repeated-close error-log behavior remains unchanged.
+described below. Repeated-close error-log duplication is now also fixed as
+described in the close/simulation section.
 
 `test_db_error_logging.php` adds seven cases (five failed before the fix, two
 already passed); all seven now pass. They cover mixed/duplicate-only diagnostics,
@@ -534,9 +538,11 @@ Existence returns false; reads throw `OutOfBoundsException`, consistently for bo
 backings and without cursor changes. `offsetExists()` still uses cached `_len`,
 never `count()`. Disconnected reads also retain interpolated SQL metadata.
 
-Replay captures initial SQL mode/autocommit at `enable_replay()`. Enable it on a
-fresh owned connection before application queries or transactions; already-open
-external transactions and arbitrary unrecorded session state cannot be reconstructed.
+Replay captures initial SQL mode/autocommit at `enable_replay()` in real mode,
+or when explicitly leaving simulation if initialization was deferred. Enable it
+on a fresh owned connection before real application queries or transactions;
+already-open external transactions and arbitrary unrecorded session state cannot
+be reconstructed.
 One destination belongs to one DB session: re-enabling it is idempotent, while
 switching files throws `LogicException`. Invalid/unwritable paths throw exceptions
 instead of terminating the process; the library no longer echoes replay status.
@@ -569,6 +575,36 @@ corresponding fix; all nine now pass. Four additional real-mysqli integration
 cases verify cursor/EOF/close behavior, multi-session replay and quoted bytes,
 301-row dump/restore with positive short writes and tiny budgets, and real factory
 setup/native query exceptions. See the live-server section below.
+
+## Idempotent error-log close and simulation-safe replay initialization
+
+`DB::close()` now compares diagnostic entries against the last completed logging
+snapshot by array key and value. Unchanged entries are not appended again, while
+new or replaced entries are logged once with their original keys/order. Identical
+text at a new key is a distinct diagnostic, not globally deduplicated. Closing an
+observably cleared list resets the snapshot; the public `errors` list is never
+cleared by logging. Duplicate filtering and disabled-output behavior are unchanged.
+Only a complete successful append advances the snapshot; false/partial writes
+leave entries eligible for retry. Partial error-log I/O recovery and concurrent
+append locking remain separate hardening concerns, not guarantees of this fix.
+
+`enable_replay()` during simulation validates/records the destination but executes
+no session-inspection query and creates no journal. Explicitly calling
+`enable_simulation(false)` initializes deferred replay before allowing real
+application execution, capturing the current real session's settings. Failed
+initialization leaves simulation active and can be explicitly retried. Existing
+replay initialized before simulation retains its original header and does not
+repeat inspection when simulation is toggled. Connected/path/destination guards
+remain unchanged, and simulated statements never enter the replay queue.
+
+`test_db_close_simulation.php` adds seven cases (six failed before the fix, one
+already passed); all seven now pass. They cover repeated close, new/replaced and
+reset diagnostics, simulation-before-replay ordering without driver/file I/O,
+real-mode initialization exactly once, initialization failure/retry, and the
+existing replay-before-simulation path. The live replay test now also measures the
+server's Questions counter to prove initialization/generated writes do not reach
+the driver while simulation is active, then verifies real replay after transition.
+All 4 lifecycle and 3 quoting tests were rerun successfully on disposable MariaDB.
 
 ## Required connection and client-escaping contract
 
@@ -640,7 +676,8 @@ real production `db.php` and real mysqli, not the stand-in. They verify:
   closed results, charset/mode configuration.
 - Executing a shared journal from multiple connections, initial autocommit-off and
   explicit uncommitted transactions, committed/savepoint data, UTF-8/quoted bytes,
-  importer mode/autocommit defaults, trailing SQL comments, and repeated close.
+  importer mode/autocommit defaults, trailing SQL comments, repeated close, and
+  simulation-before-replay initialization verified with the native Questions counter.
 - Actual 301-row dump/restore with NULL/zero/numeric text and binary-safe quoting,
   300-row checkpoints, real positive short writes, and tiny byte-budget stopping.
 - `DB::connect()` and native mysqli exceptions through write/read/close paths.

@@ -55,7 +55,12 @@ function db_live_case(string $case, mysqli $admin, string $table): mixed {
             try {
                 $handle = db_live_handle();
                 $handle->autocommit(false);
-                $db = DB::from($handle)->enable_replay($path);
+                $db = DB::from($handle)->enable_simulation(true);
+                $before = (int)$handle->query("SHOW SESSION STATUS LIKE 'Questions'")->fetch_assoc()['Value'];
+                $db->enable_replay($path)->unsafe_raw("INSERT INTO `$table` VALUES (99, 'simulated', NULL)");
+                $after = (int)$handle->query("SHOW SESSION STATUS LIKE 'Questions'")->fetch_assoc()['Value'];
+                $simulationQueries = $after - $before - 1; // Exclude the status probe itself.
+                $db->enable_simulation(false);
                 $db->unsafe_raw("INSERT INTO `$table` VALUES (1, 'pending autocommit', NULL)");
                 $db->close();
                 $db = DB::from(db_live_handle())->enable_replay($path);
@@ -83,7 +88,7 @@ function db_live_case(string $case, mysqli $admin, string $table): mixed {
                     $replayed = db_live_rows($target, $table);
                     $autocommit = $target->query('SELECT @@autocommit AS ac')->fetch_assoc()['ac'];
                 } finally { $target->close(); }
-                return [$source, $replayed, (string)$autocommit, $once];
+                return [$source, $replayed, (string)$autocommit, $once, $simulationQueries];
             } finally { unlink($path); }
         case 'dump':
             $admin->query("CREATE TABLE `$table` (id INT PRIMARY KEY, name VARCHAR(100) CHARACTER SET utf8mb4, nil INT NULL) ENGINE=InnoDB");

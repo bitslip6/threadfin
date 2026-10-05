@@ -163,6 +163,7 @@ class DB {
     protected $_replay_file = "";
     protected $_replay = [];
     protected string $_replay_header = '';
+    protected array $_logged_errors = [];
 
     protected function __construct(?\mysqli $db) { $this->_db = $db; }
 
@@ -223,6 +224,14 @@ class DB {
             throw new \InvalidArgumentException('Replay requires a non-PHP journal path');
         }
         if (!$this->_db) { throw new RuntimeException('Replay requires a connected database'); }
+        // Simulation records intent only; leaving simulation initializes the real journal.
+        if (!$this->_simulation) { $this->initialize_replay($replay_file_name); }
+        $this->_replay_file = $replay_file_name;
+        $this->_replay_enabled = true;
+        return $this;
+    }
+
+    private function initialize_replay(string $replay_file_name): void {
         // Enable before application queries; capture the session defaults used by those queries.
         $result = mysqli_query($this->_db, 'SELECT @@SESSION.sql_mode AS sql_mode, @@SESSION.autocommit AS autocommit');
         if (!$result instanceof mysqli_result) { throw new RuntimeException('Unable to inspect replay session'); }
@@ -237,9 +246,6 @@ class DB {
         $this->_replay_header = "\n-- ThreadFin replay session\nROLLBACK;\nSET NAMES utf8mb4;\n"
             . 'SET SESSION sql_mode = ' . quote($session['sql_mode']) . ";\n"
             . 'SET SESSION autocommit = ' . $session['autocommit'] . ";\n";
-        $this->_replay_file = $replay_file_name;
-        $this->_replay_enabled = true;
-        return $this;
     }
 
 
@@ -248,6 +254,10 @@ class DB {
      * @return DB 
      */
     public function enable_simulation(bool $enable) : DB {
+        if (!$enable && $this->_db && $this->_replay_enabled && $this->_replay_header === '') {
+            // Failure must leave simulation active rather than allow unjournaled execution.
+            $this->initialize_replay($this->_replay_file);
+        }
         $this->_simulation = $enable;
         $this->enable_log(true);
         return $this;
@@ -745,19 +755,24 @@ class DB {
     public function close() : void {
         if (!empty($this->_db)) { mysqli_close($this->_db); $this->_db = NULL; }
         if (SQL_ERROR_FILE) {
-            if (count($this->errors) > 0) {
-                $errors = array_filter($this->errors, function($error): bool {
-                    // Generated query diagnostics carry errno; SQL text may itself say Duplicate.
-                    if (preg_match('/\A\[.*\] errno\((\d+)\) /s', $error, $match) === 1) {
-                        return $match[1] !== '1062';
-                    }
-                    // Retain the legacy keyword policy for diagnostics without a query errno.
-                    return stripos($error, 'Duplicate') === false;
-                });
-                if (count($errors) > 0) {
-                    file_put_contents(SQL_ERROR_FILE, print_r($errors, true), FILE_APPEND);
+            $pending = array_filter($this->errors, function($error, $key): bool {
+                return !array_key_exists($key, $this->_logged_errors) || $this->_logged_errors[$key] !== $error;
+            }, ARRAY_FILTER_USE_BOTH);
+            $errors = array_filter($pending, function($error): bool {
+                // Generated query diagnostics carry errno; SQL text may itself say Duplicate.
+                if (preg_match('/\A\[.*\] errno\((\d+)\) /s', $error, $match) === 1) {
+                    return $match[1] !== '1062';
                 }
+                // Retain the legacy keyword policy for diagnostics without a query errno.
+                return stripos($error, 'Duplicate') === false;
+            });
+            $complete = true;
+            if ($errors !== []) {
+                $output = print_r($errors, true);
+                $complete = file_put_contents(SQL_ERROR_FILE, $output, FILE_APPEND) === strlen($output);
             }
+            // Keep the public list intact; only completed appends advance its logged snapshot.
+            if ($complete) { $this->_logged_errors = $this->errors; }
         }
         if ($this->_replay !== []) { $this->flush_replay(); }
     }

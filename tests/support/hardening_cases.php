@@ -101,6 +101,92 @@ function db_hardening_case(string $case): mixed {
             $db->unsafe_raw('INSERT INTO records VALUES (1)');
             $db->close();
             return file_get_contents($path);
+        case 'error_close_idempotent':
+            $db = DB::from(new mysqli());
+            $db->errors = ['[BAD] errno(1064) Syntax error', '[INSERT] errno(1062) Duplicate entry'];
+            $db->close();
+            $first = file_get_contents(SQL_ERROR_FILE);
+            $db->close();
+            return [$first, file_get_contents(SQL_ERROR_FILE), $db->errors];
+        case 'error_close_new_entries':
+            $db = DB::from(new mysqli());
+            $db->errors = ['first', 'Duplicate entry'];
+            $db->close();
+            $db->errors[0] = 'changed';
+            $db->errors[] = 'first'; // Identical text at a new key is a distinct diagnostic.
+            $db->errors[] = 'new';
+            $db->close();
+            $db->close();
+            return [file_get_contents(SQL_ERROR_FILE), $db->errors];
+        case 'error_close_observed_reset':
+            $db = DB::from(new mysqli());
+            $db->errors[] = 'first';
+            $db->close();
+            $db->errors = [];
+            $db->close();
+            $db->errors[] = 'first';
+            $db->close();
+            $db->close();
+            return file_get_contents(SQL_ERROR_FILE);
+        case 'replay_simulation_defers_init':
+            $path = db_fixture_file();
+            unlink($path);
+            try {
+                $handle = new mysqli();
+                $db = DB::from($handle)->enable_simulation(true);
+                $handle->queries = [];
+                $GLOBALS['db_fixture_query_failures'] = [
+                    'SELECT @@SESSION.sql_mode AS sql_mode, @@SESSION.autocommit AS autocommit' => 'exception'];
+                $db->enable_replay($path)->enable_replay($path);
+                $db->unsafe_raw('INSERT INTO records VALUES (99)');
+                $db->close();
+                $db->close();
+                return [$handle->queries, $db->errors, db_fixture_property($db, '_replay'),
+                    db_fixture_property($db, '_replay_header'), file_exists($path), count($db->logs)];
+            } finally {
+                unset($GLOBALS['db_fixture_query_failures']);
+                if (!file_exists($path)) { touch($path); } // Central fixture cleanup owns this path.
+            }
+        case 'replay_simulation_transition':
+            $path = db_fixture_file();
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_simulation(true);
+            $handle->queries = [];
+            $db->enable_replay($path);
+            $simulated = $db->unsafe_raw('INSERT INTO records VALUES (99)');
+            $before = [$handle->queries, db_fixture_property($db, '_replay_header')];
+            $GLOBALS['db_fixture_replay_autocommit'] = 0;
+            $db->enable_simulation(false)->enable_simulation(false);
+            $real = $db->unsafe_raw('INSERT INTO records VALUES (1)');
+            $db->close();
+            return [$before, [$simulated, $real], $handle->queries, file_get_contents($path), $db->errors];
+        case 'replay_simulation_transition_failure':
+            $path = db_fixture_file();
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_simulation(true)->enable_replay($path);
+            $handle->queries = [];
+            $GLOBALS['db_fixture_query_failures'] = [
+                'SELECT @@SESSION.sql_mode AS sql_mode, @@SESSION.autocommit AS autocommit' => 'exception'];
+            try { $db->enable_simulation(false); $rejected = false; }
+            catch (RuntimeException $error) { $rejected = true; }
+            $state = [db_fixture_property($db, '_simulation'), db_fixture_property($db, '_replay_header')];
+            $db->unsafe_raw('INSERT INTO records VALUES (99)');
+            unset($GLOBALS['db_fixture_query_failures']);
+            $db->enable_simulation(false)->unsafe_raw('INSERT INTO records VALUES (1)');
+            $db->close();
+            return [$rejected, $state, $handle->queries, file_get_contents($path), $db->errors];
+        case 'replay_real_before_simulation':
+            $path = db_fixture_file();
+            $handle = new mysqli();
+            $db = DB::from($handle)->enable_replay($path);
+            $handle->queries = [];
+            $db->enable_simulation(true)->unsafe_raw('INSERT INTO records VALUES (99)');
+            $GLOBALS['db_fixture_query_failures'] = [
+                'SELECT @@SESSION.sql_mode AS sql_mode, @@SESSION.autocommit AS autocommit' => 'exception'];
+            $db->enable_simulation(false)->unsafe_raw('INSERT INTO records VALUES (1)');
+            unset($GLOBALS['db_fixture_query_failures']);
+            $db->close();
+            return [$handle->queries, file_get_contents($path), $db->errors];
         default:
             throw new InvalidArgumentException("Unknown regression case: $case");
     }
