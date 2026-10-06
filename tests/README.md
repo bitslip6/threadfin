@@ -3,7 +3,7 @@
 These are expected-behavior TinyTest tests, not tests that expect the current bugs.
 The initial baseline was **41 failed / 0 passed / 0 incomplete / 0 skipped**.
 The SQL-injection work expanded it to **44 failed / 0 passed** before the fix.
-The current suite has **186 tests: 186 passed / 0 failed**, exit 0, with no
+The current suite has **348 tests: 348 passed / 0 failed**, exit 0, with no
 incomplete cases, skips, or runner errors. Quoting, connection failure handling,
 the dump charset-statement terminator, current-row column lookup, complete
 buffered-result array conversion, associative duplicate updates, object
@@ -19,7 +19,8 @@ replay initialization also pass. All reviewed regressions are fixed.
 
 ## Current status
 
-Verified with the default TinyTest runner: **186 total, 186 passed, 0 failed**.
+Verified with the default TinyTest runner: **348 total, 348 passed, 0 failed**.
+The additive feature APIs and restrictions are documented in [db-features.md](../docs/db-features.md).
 There are **0 incomplete tests, 0 skipped tests, and 0 runner errors**, exit code 0.
 Counts below are test functions, not assertions or separate bugs.
 
@@ -35,18 +36,24 @@ Counts below are test functions, not assertions or separate bugs.
 | `test_db_duplicate_updates.php` | 4 | 0 | 4 |
 | `test_db_error_logging.php` | 7 | 0 | 7 |
 | `test_db_hardening.php` | 9 | 0 | 9 |
+| `test_db_prepared.php` | 23 | 0 | 23 |
 | `test_db_regressions.php` | 46 | 0 | 46 |
 | `test_db_replay.php` | 7 | 0 | 7 |
+| `test_db_resumable_dump.php` | 28 | 0 | 28 |
 | `test_db_result_reads.php` | 9 | 0 | 9 |
 | `test_db_simulation.php` | 8 | 0 | 8 |
 | `test_db_sql_metadata.php` | 3 | 0 | 3 |
 | `test_db_store.php` | 6 | 0 | 6 |
 | `test_db_streams.php` | 7 | 0 | 7 |
+| `test_db_streaming.php` | 22 | 0 | 22 |
+| `test_db_telemetry.php` | 44 | 0 | 44 |
 | `test_db_templates.php` | 8 | 0 | 8 |
 | `test_db_transforms.php` | 10 | 0 | 10 |
+| `test_db_transactions.php` | 21 | 0 | 21 |
 | `test_db_upsert.php` | 6 | 0 | 6 |
+| `test_db_verify.php` | 24 | 0 | 24 |
 | `test_db_where.php` | 5 | 0 | 5 |
-| **Total** | **186** | **0** | **186** |
+| **Total** | **348** | **0** | **348** |
 
 ### Remaining failures
 
@@ -54,9 +61,10 @@ None in the default regression suite. The original reviewed regressions, nine
 close/offset/replay/cleanup cases, and seven close/simulation ordering cases pass. The coverage table below
 records the reviewed issues; integration limitations are noted separately.
 
-The opt-in live-server suites are separate from these totals: **7 passed, 0 failed**
-(3 quoting + 4 real-mysqli lifecycle tests), verified on a disposable MariaDB 12.3.3
-server for these close/simulation fixes. See the integration sections below.
+The opt-in live-server suites are separate from these totals: **138 passed, 0 failed**
+(3 quoting + 4 lifecycle + 11 transaction + 11 prepared + 11 streaming + 29 telemetry + 32 resumable-dump + 37 verifier tests), verified on disposable MariaDB
+12.3.3 with PHP 8.5.10/mysqlnd. Oracle MySQL remains unverified. See the integration
+sections below; historical validation counts describe their original changes.
 
 ## Running tests
 
@@ -605,6 +613,154 @@ existing replay-before-simulation path. The live replay test now also measures t
 server's Questions counter to prove initialization/generated writes do not reach
 the driver while simulation is active, then verifies real replay after transition.
 All 4 lifecycle and 3 quoting tests were rerun successfully on disposable MariaDB.
+
+## Transaction callback tests
+
+`test_db_transactions.php` adds 21 isolated boundary tests. Its dedicated child
+fixtures extend only canned driver outcomes, not a SQL/transaction engine. Cases
+cover falsey returns, actual failure latches independent of public errors or
+sentinels, nested savepoints, abort/cleanup failures, ownership, replay ordering,
+simulation, conservative SQL/lifecycle guards, caught/repaired builder validation,
+and exception handling when the early PHP 8.1 mysqli exception lacks getSqlState.
+
+```sh
+php /home/cory/Work/tinytest/tinytest.php -j -f tests/test_db_transactions.php
+THREADFIN_TEST_MYSQL_SOCKET=/path/to/disposable/server.sock \
+THREADFIN_TEST_MYSQL_DATABASE=empty_disposable_database \
+THREADFIN_TEST_MYSQL_ALLOW_SCHEMA_CHANGES=1 \
+php /home/cory/Work/tinytest/tinytest.php -j \
+  -f tests/integration/test_db_transactions_mysql.php
+```
+
+The 11 native tests prove actual committed/rolled-back InnoDB rows, ignored query
+failures, nested recovery, rejection without committing external transactions,
+real deadlocks, killed-connection cleanup, journal replay, no simulation queries,
+and reusable sessions under completion_type CHAIN/RELEASE on success/failure.
+Tests clean their uniquely named tables. Use only an empty disposable database.
+Ambiguous commit-acknowledgement loss, native PHP 8.1 and Oracle MySQL execution
+remain unverified. No automatic retries or nontransactional rollback guarantee.
+
+## Native prepared-query tests
+
+`test_db_prepared.php` adds 23 isolated driver-boundary tests; run it with the
+same TinyTest `-j -f` command as transaction tests. Opt-in native coverage:
+
+```sh
+THREADFIN_TEST_MYSQL_SOCKET=/path/to/disposable/server.sock \
+THREADFIN_TEST_MYSQL_DATABASE=empty_disposable_database \
+THREADFIN_TEST_MYSQL_ALLOW_SCHEMA_CHANGES=1 \
+php /home/cory/Work/tinytest/tinytest.php -j \
+  -f tests/integration/test_db_prepared_mysql.php
+```
+
+The 11 native cases cover injection/type/byte round trips, null/empty/numeric text,
+large and empty explicit binary parameters, count/ID modes, parameter mismatch,
+transaction failure integration, simulation without prepare, replay rejection,
+and canary-safe OFF/warning-only/STRICT driver reporting with caller-handler
+restoration. Dedicated transport rejects unexpected stdout/stderr. Cleanup and
+advisory-warning fault cases are canned boundary tests, not live protocol faults.
+Native non-mysqlnd and PHP8.1 execution remain unverified. Full exception traces
+require `zend.exception_ignore_args=1`; see the feature documentation privacy note.
+
+## Streaming tests and opt-in memory benchmark
+
+`test_db_streaming.php` adds 22 isolated tests. Native coverage uses the same empty
+disposable-server environment as prepared tests with
+`-f tests/integration/test_db_streaming_mysql.php`: 11 cases prove raw/prepared
+row copies, early cancellation, retained iterators, busy-before-I/O, idempotent
+cleanup, scope-exit rollback, simulation, DB closure, and actual mid-fetch failure
+using KILL CONNECTION against the test's own reader. A killed connection is not
+silently retried; recovery uses a fresh connection.
+
+Reproducible memory gate (creates and cleans its fixture; disposable server only):
+
+```sh
+THREADFIN_STREAMING_BENCHMARK=1 \
+THREADFIN_TEST_MYSQL_SOCKET=/path/to/disposable/server.sock \
+THREADFIN_TEST_MYSQL_DATABASE=empty_disposable_database \
+THREADFIN_TEST_MYSQL_ALLOW_SCHEMA_CHANGES=1 \
+php -n -d extension=mysqli benchmark/streaming_memory.php
+```
+
+Parent validation: each separate raw/prepared reader streamed 32,768 rows × 8KiB
+(256MiB payload) with a 32MiB limit, 413,544-byte peak PHP delta and 2MiB allocated
+peak. This is cardinality-bounded PHP allocation evidence on mysqlnd, not OS RSS
+or a bound independent of row size. Retained foreach breaks require explicit
+close, and cancellation can drain server data. No server is started/stopped by
+the benchmark. The driver remains loaded only in these opt-in children.
+
+## Privacy-safe telemetry tests
+
+`test_db_telemetry.php` adds 44 unit tests. Use the same native disposable-server
+environment above with `-f tests/integration/test_db_telemetry_mysql.php` for
+29 native tests. Coverage includes immutable scalar/HMAC events, secret canaries
+across raw/prepared/stream/simulation/failure paths, bounded sampling/thresholds,
+monotonic stream timing, observer exceptions and recursion isolation, retained
+simulated streams after observer replacement, actual outcomes rather than
+sentinels, nested Stringable-triggered operations, and simulation changes during
+template rendering. Disabled paths perform no hash/timing/event/extra-driver work;
+paired native timing evidence has overlapping ranges, not a zero-overhead claim.
+See feature documentation for observer options, timing boundaries and the
+separate PHP exception-trace privacy requirement.
+
+## Resumable dump tests
+
+`test_db_resumable_dump.php` adds 28 unit tests. Native suite:
+
+```sh
+THREADFIN_TEST_MYSQL_SOCKET=/path/to/disposable/source.sock \
+THREADFIN_TEST_MYSQL_SECOND_SOCKET=/path/to/separate/disposable/server.sock \
+THREADFIN_TEST_MYSQL_DATABASE=empty_disposable_database \
+THREADFIN_TEST_MYSQL_ALLOW_SCHEMA_CHANGES=1 \
+php /home/cory/Work/tinytest/tinytest.php -j \
+  -f tests/integration/test_db_resumable_dump_mysql.php
+```
+
+The same named empty database must exist on both independent instances; neither
+may be production. The second socket proves checkpoint rejection across different
+servers with otherwise identical schema/host/version/port metadata. All 32 cases
+passed with both configured. Tests create/clean their tables and temporary users.
+
+Native coverage proves multi-table keyset resume/restore row and SHOW CREATE
+schema equivalence, integer extrema/zero auto-ID, binary/charset/decimal/temporal
+fidelity, YEAR(2) rejection, tiny budgets, corrupt/short/aliased output, schema drift,
+hidden-trigger permission rejection, source identity, and autocommit-off restore
+verified from an independent connection. Child processes really exit before/after
+checkpoint publication and during partial writes; this is process-restart evidence,
+not power-loss testing. Initial unpublished nonempty output rejects as an orphan.
+
+## Opt-in sandboxed replay verification tests
+
+`test_db_verify.php` has24 default unit tests for lexer/envelope boundaries,
+unsupported modes/DDL, malformed/duplicate packets, typed NULL/length framing,
+strict manifest validation including numeric identifiers, input/report aliasing,
+atomic publication/privacy and explicit opt-in. No server is started by these tests.
+
+`integration/test_db_verify_mysql.php` adds37 native tests. It uses an explicitly
+configured **empty disposable source schema** and starts a fresh private MariaDB
+server for each actual verification attempt. Installed Linux MariaDB/POSIX/setsid
+and loadable mysqli are required; no software is installed. The fixture requires
+permission to create/clean its test tables and temporary restricted users.
+
+```sh
+THREADFIN_TEST_MYSQL_SOCKET=/path/to/disposable/server.sock \
+THREADFIN_TEST_MYSQL_DATABASE=threadfin_features \
+THREADFIN_TEST_MYSQL_ALLOW_SCHEMA_CHANGES=1 \
+THREADFIN_TEST_MYSQL_USER=root \
+php /home/cory/Work/tinytest/tinytest.php -j \
+  -f tests/integration/test_db_verify_mysql.php
+```
+
+Coverage includes end-to-end baseline/journal comparison, exact cut/hash handling,
+byte/NULL/type/schema mismatches, SELECT-only source snapshots, native privilege
+and LOCAL INFILE denial independent of parser checks, timeout/disk-limit/cleanup
+outcomes, private CLI reports, restricted DDL and unsupported types. Auto-increment
+counter differences normalize without changing quoted bytes; numeric table names
+`0`, `123`, `00123` round-trip distinctly through manifests/comparison/report hashes.
+All37 passed on MariaDB12.3.3/PHP8.5.10; no verifier process or private directory
+remained after gates. Sampling limits are not OS quotas, and abrupt supervisor
+SIGKILL/power-loss cleanup is not guaranteed. See the feature documentation for the
+full source-attestation, compatibility and resource contract.
 
 ## Required connection and client-escaping contract
 
