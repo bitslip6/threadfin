@@ -144,8 +144,8 @@ SQL;
     $insert="INSERT INTO $q VALUES (0,X'000AFF','00123',1.20,1970),(1,NULL,'',-2.00,2070)";
     $admin->query($insert); $baseline=$ddl.";\n".$insert.";\n";
     if ($case==='actual_dump') {
-        define('SQL_ERROR_FILE',false); require_once __DIR__.'/../../core.php'; require_once __DIR__.'/../../db.php';
-        $db=ThreadFin\DB\DB::from(vconnect());
+        define('SQL_ERROR_FILE',false); require_once __DIR__.'/../../core.php'; require_once __DIR__.'/../../db-extended.php';
+        $db=ThreadFin\DB\DBExtended::from(vconnect());
         try { $dump=$db->dump_resumable($dir.'/dump.sql',$dir.'/checkpoint.json',['source_id'=>'verify-baseline','source_frozen'=>true,'source_idle'=>true]); assert($dump->complete); }
         finally { $db->close(); }
         $baseline=file_get_contents($dir.'/dump.sql');
@@ -171,15 +171,15 @@ SQL;
     $journal=vpacket($body);
     if ($case==='shared') { $admin->query("UPDATE $q SET s='shared' WHERE id=0"); $journal.=vpacket("UPDATE $q SET s='shared' WHERE id=0"); }
     if ($case==='actual_journal') {
-        define('SQL_ERROR_FILE',false); require __DIR__.'/../../core.php'; require __DIR__.'/../../db.php';
-        $db=ThreadFin\DB\DB::from(vconnect()); $db->enable_replay($dir.'/actual.sql');
+        define('SQL_ERROR_FILE',false); require __DIR__.'/../../core.php'; require __DIR__.'/../../db-extended.php';
+        $db=ThreadFin\DB\DBExtended::from(vconnect()); $db->enable_replay($dir.'/actual.sql');
         try {
             $db->transaction(function($db) use($q) {
                 try { $db->transaction(function($db) use($q) { $db->unsafe_raw("UPDATE $q SET s='nested-rollback' WHERE id=1"); throw new RuntimeException('rollback'); }); } catch(RuntimeException $e) {}
                 $db->unsafe_raw("UPDATE $q SET s='actual' WHERE id=0");
             });
         } finally { $db->close(); }
-        $db=ThreadFin\DB\DB::from(vconnect()); $db->enable_replay($dir.'/actual.sql');
+        $db=ThreadFin\DB\DBExtended::from(vconnect()); $db->enable_replay($dir.'/actual.sql');
         try { $db->unsafe_raw('START TRANSACTION'); $db->unsafe_raw("UPDATE $q SET s='session-rollback' WHERE id=1"); $db->unsafe_raw('ROLLBACK'); } finally { $db->close(); }
         $journal=vpacket($body).file_get_contents($dir.'/actual.sql');
     }

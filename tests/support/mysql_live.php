@@ -3,9 +3,9 @@
 error_reporting(E_ALL & ~E_DEPRECATED);
 define('SQL_ERROR_FILE', false);
 require __DIR__ . '/../../core.php';
-require __DIR__ . '/../../db.php';
+require __DIR__ . '/../../db-extended.php';
 
-use ThreadFin\DB\DB;
+use ThreadFin\DB\DBExtended as DB;
 use ThreadFin\DB\Credentials;
 use function ThreadFin\DB\quote;
 use function ThreadFin\DB\dump_database;

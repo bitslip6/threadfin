@@ -17,7 +17,6 @@ use ThreadFin\Core\MaybeStr;
 
 use function ThreadFin\Core\partial_right as bind_r;
 use function ThreadFin\Log\debug;
-use function ThreadFin\Util\utc_time;
 
 const DB_FETCH_SUCCESS = 1;
 const DB_FETCH_NUM_ROWS = 2;
@@ -65,11 +64,6 @@ interface FromSQL
     public static function from_sql(array $sql): mixed;
 }
 
-
-// set the error log file if running in cli mode
-if (!defined("SQL_ERROR_FILE")) {
-    define("SQL_ERROR_FILE", "/tmp/php_sql_errors.log");
-}
 
 /**
  * store mysql login credentials
@@ -217,20 +211,12 @@ final class BinaryParameter
 class DB
 {
     public $errors = [];
-    public $logs = [];
     public $host;
     public $user;
     public $database;
     public $last_stmt = "";
 
     protected $_db;
-    protected $_log_enabled = false;
-    protected $_simulation = false;
-    protected $_replay_enabled = false;
-    protected $_replay_file = "";
-    protected $_replay = [];
-    protected string $_replay_header = '';
-    protected array $_logged_errors = [];
     /** @var array<?ExecutionFailure> Failure latch per active helper, independent of public errors. */
     private array $_transaction_scopes = [];
     private int $_transaction_savepoint = 0;
@@ -240,97 +226,6 @@ class DB
     private array $_prepared_cleanup_errors = [];
     private array $_stream_cleanup_errors = [];
     private ?StreamingRows $_active_stream = null;
-    private ?TelemetryObserver $_telemetry = null;
-    private ?TelemetryGuard $_telemetry_guard = null;
-    private ?TelemetryOperation $_telemetry_operation = null;
-    /** One internal call may consume this marker before any application-capable work. */
-    private ?string $_telemetry_delegate = null;
-    /** Forced resource disconnect still owes the normal journal/error close lifecycle. */
-    private bool $_resource_close_pending = false;
-
-    /**
-     * Optional privacy-safe immutable QueryEvent observer. No SQL/value/sample mode.
-     * Options: sample_rate [0,1], slow_threshold_ms [0,86400000], hmac_key >=16 bytes.
-     * Defaults: all operations, no threshold, fresh random HMAC key per installation.
-     * Identifiers hash exact input templates, not normalized SQL shapes. Raw builders
-     * have only rendered SQL available. No changes to legacy logs/replay redaction.
-     * Sampling occurs once; rate zero performs no timing/hashing/event allocation.
-     * Timing begins at the selected execution seam (including local validation and
-     * fetch/stream template rendering, but excluding builders before that seam) and
-     * ends after result setup/cleanup. HMAC/sampling and terminal dispatch are excluded.
-     * Stream duration includes consumer delays and cancellation drain; startup/first-row
-     * are separate. Start callback time is consequently part of the terminal duration.
-     * Threshold zero emits stream start+terminal; positive thresholds terminal-only.
-     * Observer errors are swallowed into saturating scalar counters. Same-DB recursive
-     * operations/configuration and retained stream mutation reject without poisoning
-     * transactions. Close an active stream before replacing/disabling observation.
-     * Callbacks run after scoped driver warning handlers are restored. Retained
-     * simulated streams finish through their originating observer even after disable
-     * or replacement; the shared recursion guard remains effective across installations.
-     */
-    public function observe(?callable $observer, array $options = []): DB
-    {
-        $this->_telemetry_guard?->guard();
-        if ($this->_active_stream !== null) {
-            throw new \LogicException('Cannot replace observer with an open stream');
-        }
-        if ($observer === null) {
-            if ($options !== []) {
-                throw new \InvalidArgumentException('Disabled observation takes no options');
-            }
-            $this->_telemetry = null;
-        } else {
-            require_once __DIR__ . '/db_telemetry.php';
-            $guard = $this->_telemetry_guard ?? new TelemetryGuard();
-            $this->_telemetry = new TelemetryObserver($observer, $options, $guard);
-            $this->_telemetry_guard = $guard;
-        }
-        return $this;
-    }
-
-    /** Counters for the current installation, reset on replace/disable; no event history. */
-    public function telemetry_diagnostics(): array
-    {
-        return $this->_telemetry?->diagnostics() ?? ['observer_failures' => 0, 'recursive_rejections' => 0];
-    }
-
-    /** Call-scoped context: internal re-entry consumes a single delegation marker.
-     * Application calls made later (e.g. Stringable rendering) start independent
-     * operations, even when unsampled or disabled, then restore the enclosing context.
-     * self:: re-entry avoids invoking a subclass override a second time.
-     * Never-observed ordinary execution allocates neither contexts nor closures.
-     */
-    private function observe_operation(string $kind, string $template, string $delegate, callable $execute): mixed
-    {
-        $observer = $this->_telemetry;
-        $operation = $observer?->begin($kind, $template, $this->_simulation);
-        $previousOperation = $this->_telemetry_operation;
-        $previousDelegate = $this->_telemetry_delegate;
-        $this->_telemetry_delegate = $delegate;
-        $this->_telemetry_operation = $operation;
-        try {
-            $result = $execute();
-        } catch (\Throwable $error) {
-            // Restore the caller's context before dispatch; observer recursion has its
-            // own stable guard and must not be confused with application nesting.
-            $this->_telemetry_delegate = $previousDelegate;
-            $this->_telemetry_operation = $previousOperation;
-            $operation?->finish('failure', $error);
-            throw $error;
-        } finally {
-            $this->_telemetry_delegate = $previousDelegate;
-            $this->_telemetry_operation = $previousOperation;
-        }
-        if ($result instanceof StreamingRows) {
-            if ($observer !== null) {
-                $result->attach_observer($observer, $operation);
-            }
-            $operation?->stream_start();
-        } else {
-            $operation?->finish();
-        }
-        return $result;
-    }
 
     protected function __construct(?\mysqli $db)
     {
@@ -339,41 +234,8 @@ class DB
 
     public function __destruct()
     {
-        if ($this->_db || $this->_resource_close_pending) {
+        if ($this->_db) {
             $this->close();
-        }
-    }
-
-    /** Frozen-source, integer-primary-key export; see db_dump.php for limits/recovery. */
-    public function dump_resumable(string $output_path, string $checkpoint_path, array $options = []): DumpReport
-    {
-        $this->guard_dump_read();
-        require_once __DIR__ . '/db_dump.php';
-        // Defensive against custom fetch overrides changing lifecycle mid-operation.
-        // Ordinary observer callbacks already reject same-DB lifecycle mutations.
-        $read = function (string $sql, array $parameters): SQL {
-            $this->guard_dump_read();
-            $result = $this->fetch_prepared($sql, $parameters);
-            try {
-                $this->guard_dump_read();
-            } catch (\Throwable $error) {
-                $result->close();
-                throw $error;
-            }
-            return $result;
-        };
-        return ResumableDump::run($read, $output_path, $checkpoint_path, $options);
-    }
-
-    private function guard_dump_read(): void
-    {
-        $this->_telemetry_guard?->guard();
-        $this->reject_transaction_change();
-        if ($this->_active_stream !== null) {
-            $this->reject_busy_stream();
-        }
-        if ($this->_simulation || !$this->connected()) {
-            throw new \LogicException('Resumable dumps require a real connected frozen source');
         }
     }
 
@@ -390,7 +252,7 @@ class DB
      */
     public static function from(?\mysqli $mysqli): DB
     {
-        $db = new DB($mysqli);
+        $db = new static($mysqli);
         if ($mysqli === null) {
             return $db;
         }
@@ -411,105 +273,15 @@ class DB
     }
 
     /**
-     * @param bool $enable - enable or disable logging
-     * @return DB 
-     */
-    public function enable_log(bool $enable): DB
-    {
-        $this->_telemetry_guard?->guard();
-        $this->_log_enabled = $enable;
-        return $this;
-    }
-
-    /**
-     * @param string $replay_file_name - the name of the replay log to record to
-     * @return DB 
-     */
-    public function enable_replay(string $replay_file_name): DB
-    {
-        $this->_telemetry_guard?->guard();
-        if ($this->_active_stream !== null) {
-            $this->reject_busy_stream();
-        }
-        $this->reject_transaction_change();
-        if ($this->_replay_enabled) {
-            if ($replay_file_name !== $this->_replay_file) {
-                throw new \LogicException('Cannot change replay destination during a database session');
-            }
-            return $this;
-        }
-        if ($replay_file_name === '' || stripos($replay_file_name, '.php') !== false) {
-            throw new \InvalidArgumentException('Replay requires a non-PHP journal path');
-        }
-        if (!$this->_db) {
-            throw new RuntimeException('Replay requires a connected database');
-        }
-        // Simulation records intent only; leaving simulation initializes the real journal.
-        if (!$this->_simulation) {
-            $this->initialize_replay($replay_file_name);
-        }
-        $this->_replay_file = $replay_file_name;
-        $this->_replay_enabled = true;
-        return $this;
-    }
-
-    private function initialize_replay(string $replay_file_name): void
-    {
-        // Enable before application queries; capture the session defaults used by those queries.
-        $result = mysqli_query($this->_db, 'SELECT @@SESSION.sql_mode AS sql_mode, @@SESSION.autocommit AS autocommit');
-        if (!$result instanceof mysqli_result) {
-            throw new RuntimeException('Unable to inspect replay session');
-        }
-        try {
-            $session = $result->fetch_assoc();
-        } finally {
-            $result->free();
-        }
-        if (!isset($session['sql_mode'], $session['autocommit']) || !in_array((string)$session['autocommit'], ['0', '1'], true)) {
-            throw new RuntimeException('Invalid replay session settings');
-        }
-        $fp = @fopen($replay_file_name, 'c+b');
-        if ($fp === false) {
-            throw new RuntimeException('Unable to create replay log: ' . $replay_file_name);
-        }
-        fclose($fp);
-        $this->_replay_header = "\n-- ThreadFin replay session\nROLLBACK;\nSET NAMES utf8mb4;\n"
-            . 'SET SESSION sql_mode = ' . quote($session['sql_mode']) . ";\n"
-            . 'SET SESSION autocommit = ' . $session['autocommit'] . ";\n";
-    }
-
-
-    /**
-     * @param bool $enable - enable or disable simulation (no queries, just the query log)
-     * @return DB 
-     */
-    public function enable_simulation(bool $enable): DB
-    {
-        $this->_telemetry_guard?->guard();
-        if ($this->_active_stream !== null) {
-            $this->reject_busy_stream();
-        }
-        $this->reject_transaction_change();
-        if (!$enable && $this->_db && $this->_replay_enabled && $this->_replay_header === '') {
-            // Failure must leave simulation active rather than allow unjournaled execution.
-            $this->initialize_replay($this->_replay_file);
-        }
-        $this->_simulation = $enable;
-        $this->enable_log(true);
-        return $this;
-    }
-
-
-    /**
      * @param null|Credentials $cred create a new DB connection
      * @return DB 
      */
     public static function cred_connect(?Credentials $cred): DB
     {
         if ($cred == NULL) {
-            return DB::from(NULL);
+            return static::from(NULL);
         }
-        return DB::connect($cred->host, $cred->username, $cred->password, $cred->db_name);
+        return static::connect($cred->host, $cred->username, $cred->password, $cred->db_name);
     }
 
     /**
@@ -525,7 +297,7 @@ class DB
     {
         $connection = mysqli_init();
         if ($connection === false) {
-            $db = DB::from(null);
+            $db = static::from(null);
             $db->errors[] = 'Unable to initialize database connection';
             return $db;
         }
@@ -538,12 +310,12 @@ class DB
             }
         } catch (Exception $ex) {
             mysqli_close($connection);
-            $db = DB::from(null);
+            $db = static::from(null);
             $db->errors[] = $ex->getMessage();
             return $db;
         }
         // from() configures new and externally supplied connections identically.
-        $db = DB::from($connection);
+        $db = static::from($connection);
         $db->host = $host;
         $db->user = $user;
         $db->database = $db_name;
@@ -562,7 +334,6 @@ class DB
      */
     public function transaction(callable $callback): mixed
     {
-        $this->_telemetry_guard?->guard();
         if ($this->_active_stream !== null) {
             $this->reject_busy_stream();
         }
@@ -575,7 +346,7 @@ class DB
         $savepoint = $outer ? '' : 'threadfin_sp_' . ++$this->_transaction_savepoint;
         $owned = false;
         try {
-            if (!$this->_simulation) {
+            if (true) {
                 if (!$this->_db) {
                     throw $this->record_execution_failure('Transaction requires a connection');
                 }
@@ -613,7 +384,7 @@ class DB
                 throw $failure;
             }
             $this->assert_transaction_usable();
-            if (!$this->_simulation) {
+            if (true) {
                 // Session completion_type must neither chain a new transaction nor release our connection.
                 $this->transaction_control($outer ? 'COMMIT AND NO CHAIN NO RELEASE' : 'RELEASE SAVEPOINT ' . $savepoint);
             }
@@ -625,7 +396,7 @@ class DB
                 } catch (\Throwable $cleanup) {
                 }
             }
-            if ($owned && !$this->_simulation) {
+            if ($owned) {
                 // A server-wide abort destroys savepoints; only the outer owner can clean up.
                 $invalid = $this->_transaction_scopes[$index]?->transactionInvalidated ?? false;
                 if ($outer || !$invalid) {
@@ -711,7 +482,7 @@ class DB
         }
     }
 
-    private function reject_transaction_change(): void
+    protected function reject_transaction_change(): void
     {
         if ($this->_transaction_scopes !== []) {
             throw $this->record_execution_failure('Cannot change database lifecycle inside a transaction callback');
@@ -790,7 +561,6 @@ class DB
      * @return DB_FETCH_SUCCESS -1 on error, 1 on success
      *  DB_FETCH_NUM_ROWS -1 on error, 0 if no rows affected, >0 if rows affected
      *  DB_FETCH_INSERT_ID -1 on error, >0 if insert id
-     *  In simulation: 1 for DB_FETCH_SUCCESS, 0 for counts/IDs (no execution).
      */
     public function unsafe_raw(string $sql, int $mode = DB_FETCH_SUCCESS): int
     {
@@ -805,14 +575,6 @@ class DB
      */
     protected function _qb(string $sql, int $return_type = DB_FETCH_SUCCESS): int
     {
-        if ($this->_telemetry_guard !== null) {
-            $this->_telemetry_guard->guard();
-            if ($this->_telemetry_delegate === __FUNCTION__) {
-                $this->_telemetry_delegate = null;
-            } elseif ($this->_telemetry !== null || $this->_telemetry_operation !== null) {
-                return $this->observe_operation($this->_transaction_control ? 'transaction_control' : 'raw', $sql, __FUNCTION__, fn() => self::_qb($sql, $return_type));
-            }
-        }
         if ($this->_active_stream !== null) {
             $this->reject_busy_stream();
         }
@@ -822,13 +584,6 @@ class DB
             $this->guard_transaction_sql($sql);
         }
         $this->last_stmt = "$sql\n";
-        if ($this->_simulation) {
-            if ($this->_log_enabled) {
-                $this->logs[] = "# [$sql] simulated (not executed)";
-            }
-            // No driver counts/IDs exist for a statement that was not executed.
-            return ($return_type === DB_FETCH_NUM_ROWS || $return_type === DB_FETCH_INSERT_ID) ? 0 : 1;
-        }
         $r = false;
         $affected = -1;
         $errno = 0;
@@ -844,25 +599,11 @@ class DB
                 $this->record_driver_failure($ex ?? null);
             }
             $errno = mysqli_errno($this->_db);
-            $this->_telemetry_operation?->fail($errno, mysqli_sqlstate($this->_db));
             $err = "[$sql] errno($errno) " . mysqli_error($this->_db);
             $this->errors[] = $err;
             return -1;
         } else {
-            if ($this->_replay_enabled || $this->_log_enabled || $return_type == DB_FETCH_NUM_ROWS) {
-                $affected = mysqli_affected_rows($this->_db);
-                if ($this->_log_enabled) {
-                    $msg = "# [$sql] errno($errno) affected rows($affected)";
-                    $this->logs[] = $msg;
-                }
-                // Successful DDL, no-op writes, and transaction controls also belong in replay.
-                if ($this->_replay_enabled) {
-                    $this->_replay[] = $sql;
-                }
-            }
-            if ($this->_telemetry_operation !== null) {
-                $this->_telemetry_operation->counts(null, (int)mysqli_affected_rows($this->_db));
-            }
+            $affected = $return_type == DB_FETCH_NUM_ROWS ? mysqli_affected_rows($this->_db) : -1;
             if ($return_type == DB_FETCH_NUM_ROWS) {
                 return intval($affected);
             } else if ($return_type == DB_FETCH_INSERT_ID) {
@@ -879,14 +620,6 @@ class DB
      */
     protected function _qr(string $sql, $mode = MYSQLI_ASSOC): SQL
     {
-        if ($this->_telemetry_guard !== null) {
-            $this->_telemetry_guard->guard();
-            if ($this->_telemetry_delegate === __FUNCTION__) {
-                $this->_telemetry_delegate = null;
-            } elseif ($this->_telemetry !== null || $this->_telemetry_operation !== null) {
-                return $this->observe_operation($this->_transaction_control ? 'transaction_control' : 'fetch', $sql, __FUNCTION__, fn() => self::_qr($sql, $mode));
-            }
-        }
         if ($this->_active_stream !== null) {
             $this->reject_busy_stream();
         }
@@ -894,13 +627,6 @@ class DB
             $this->guard_transaction_sql($sql);
         }
         assert(! empty($this->_db), "database: {$this->database} is not connected");
-        $this->_telemetry_operation?->execution_mode($this->_simulation);
-        if ($this->_simulation) {
-            if ($this->_log_enabled) {
-                $this->logs[] = "# [$sql] simulated (not executed)";
-            }
-            return SQL::from(null, $sql);
-        }
         $r = false;
         $errno = 0;
         try {
@@ -915,23 +641,14 @@ class DB
                 $this->record_driver_failure($ex ?? null);
             }
             $errno = mysqli_errno($this->_db);
-            $this->_telemetry_operation?->fail($errno, mysqli_sqlstate($this->_db));
             $err = "[$sql] errno($errno) " . mysqli_error($this->_db);
             $this->errors[] = $err;
             return SQL::from(NULL, $sql);
-        } else {
-            if ($this->_log_enabled) {
-                $e = mysqli_affected_rows($this->_db);
-                $msg = "# [$sql] errno($errno) selected rows($e)";
-                $this->logs[] = $msg;
-            }
         }
-
-        $this->_telemetry_operation?->counts((int)$r->num_rows, null);
         return SQL::fetch($r, $sql);
     }
 
-    private function reject_busy_stream(): never
+    protected function reject_busy_stream(): never
     {
         throw $this->record_execution_failure('Connection is busy with an open stream');
     }
@@ -949,14 +666,6 @@ class DB
      */
     public function stream(string $sql, $data = null): StreamingRows
     {
-        if ($this->_telemetry_guard !== null) {
-            $this->_telemetry_guard->guard();
-            if ($this->_telemetry_delegate === __FUNCTION__) {
-                $this->_telemetry_delegate = null;
-            } elseif ($this->_telemetry !== null || $this->_telemetry_operation !== null) {
-                return $this->observe_operation('stream', $sql, __FUNCTION__, fn() => self::stream($sql, $data));
-            }
-        }
         if ($this->_active_stream !== null) {
             $this->reject_busy_stream();
         }
@@ -968,13 +677,6 @@ class DB
         }
         if ($this->_transaction_scopes !== []) {
             $this->guard_transaction_sql($sql);
-        }
-        $this->_telemetry_operation?->execution_mode($this->_simulation);
-        if ($this->_simulation) {
-            if ($this->_log_enabled) {
-                $this->logs[] = "# [$sql] simulated (not executed)";
-            }
-            return new StreamingRows($sql, null, null);
         }
         if (!$this->_db) {
             throw $this->record_execution_failure('Stream requires a connection');
@@ -997,7 +699,6 @@ class DB
     /** Native positional parameters; same validation as fetch_prepared, never buffers rows. */
     public function stream_prepared(string $sql, array $parameters = []): StreamingRows
     {
-        $this->_telemetry_guard?->guard();
         require_once __DIR__ . '/db_stream.php';
         return $this->run_prepared($sql, $parameters, true, DB_FETCH_SUCCESS, true);
     }
@@ -1085,7 +786,6 @@ class DB
                         } catch (\Throwable $error) {
                         } finally {
                             $db->_db = null;
-                            $db->_resource_close_pending = true;
                         }
                     }
                 }
@@ -1118,7 +818,6 @@ class DB
      */
     public function execute_prepared(string $sql, array $parameters = [], int $mode = DB_FETCH_SUCCESS): int
     {
-        $this->_telemetry_guard?->guard();
         if (!in_array($mode, [DB_FETCH_SUCCESS, DB_FETCH_NUM_ROWS, DB_FETCH_INSERT_ID], true)) {
             throw new \InvalidArgumentException('Invalid prepared return mode');
         }
@@ -1139,14 +838,6 @@ class DB
 
     private function run_prepared(string $sql, array $parameters, bool $read, int $mode, bool $stream = false): SQL|int|StreamingRows
     {
-        if ($this->_telemetry_guard !== null) {
-            $this->_telemetry_guard->guard();
-            if ($this->_telemetry_delegate === __FUNCTION__) {
-                $this->_telemetry_delegate = null;
-            } elseif ($this->_telemetry !== null || $this->_telemetry_operation !== null) {
-                return $this->observe_operation($stream ? 'stream_prepared' : ($read ? 'prepared_fetch' : 'prepared_execute'), $sql, __FUNCTION__, fn() => self::run_prepared($sql, $parameters, $read, $mode, $stream));
-            }
-        }
         if ($this->_active_stream !== null) {
             $this->reject_busy_stream();
         }
@@ -1181,19 +872,9 @@ class DB
         if (!$this->_db) {
             throw $this->record_execution_failure('Prepared operation requires a connection');
         }
-        if (!$read && !$this->_simulation && $this->_replay_enabled) {
-            throw $this->record_execution_failure('Prepared execution is incompatible with legacy replay');
-        }
         if (!$read) {
             $this->last_stmt = "$sql\n";
         }
-        if ($this->_simulation) {
-            if ($this->_log_enabled) {
-                $this->logs[] = '# Prepared operation simulated (not executed)';
-            }
-            return $stream ? new StreamingRows($sql, null, null) : ($read ? SQL::from(null, $sql) : ($mode === DB_FETCH_SUCCESS ? 1 : 0));
-        }
-
         $statement = null;
         $metadata = null;
         $primary = null;
@@ -1274,9 +955,6 @@ class DB
             } else {
                 $result = 1;
             }
-            if ($this->_telemetry_operation !== null && !$stream) {
-                $this->_telemetry_operation->counts($read ? count($rows) : null, $read ? null : (int)$statement->affected_rows);
-            }
         } catch (\Throwable $error) {
             $primary = $error instanceof ExecutionFailure ? $error : $this->prepared_driver_failure($statement ?: null, $error);
         } finally {
@@ -1291,9 +969,6 @@ class DB
         }
         if ($cleanup !== null) {
             throw $cleanup;
-        }
-        if ($this->_log_enabled) {
-            $this->logs[] = $stream ? '# Prepared stream opened' : '# Prepared operation completed';
         }
         return $result;
     }
@@ -1372,7 +1047,6 @@ class DB
                     $warning = true;
                 } finally {
                     $this->_db = null;
-                    $this->_resource_close_pending = true;
                 }
                 if ($warning) {
                     $record();
@@ -1396,32 +1070,11 @@ class DB
      */
     public function fetch(string $sql, $data = NULL, $mode = MYSQLI_ASSOC): SQL
     {
-        if ($this->_telemetry_guard !== null) {
-            $this->_telemetry_guard->guard();
-            if ($this->_telemetry_delegate === __FUNCTION__) {
-                $this->_telemetry_delegate = null;
-                $observedFetch = true;
-            } elseif ($this->_telemetry !== null || $this->_telemetry_operation !== null) {
-                return $this->observe_operation('fetch', $sql, __FUNCTION__, fn() => self::fetch($sql, $data, $mode));
-            }
-        }
         $new_sql = $this->fetch_to_statement($sql, $data, $mode);
 
         // runtime errors
         if ($this->_db == NULL) {
-            $this->_telemetry_operation?->fail();
             return SQL::from(NULL, $new_sql);
-        }
-        if (isset($observedFetch)) {
-            // This exact call is the buffered execution part of this fetch, not a
-            // nested application operation. Rendering (and Stringable calls) is over.
-            $previousDelegate = $this->_telemetry_delegate;
-            $this->_telemetry_delegate = '_qr';
-            try {
-                return $this->_qr($new_sql, $mode);
-            } finally {
-                $this->_telemetry_delegate = $previousDelegate;
-            }
         }
         return $this->_qr($new_sql, $mode);
     }
@@ -1768,7 +1421,6 @@ class DB
      */
     public function close(): void
     {
-        $this->_telemetry_guard?->guard();
         $this->reject_transaction_change();
         $streamFailure = null;
         if ($this->_active_stream !== null) {
@@ -1782,77 +1434,11 @@ class DB
             mysqli_close($this->_db);
             $this->_db = NULL;
         }
-        if (SQL_ERROR_FILE) {
-            $pending = array_filter($this->errors, function ($error, $key): bool {
-                return !array_key_exists($key, $this->_logged_errors) || $this->_logged_errors[$key] !== $error;
-            }, ARRAY_FILTER_USE_BOTH);
-            $errors = array_filter($pending, function ($error): bool {
-                // Generated query diagnostics carry errno; SQL text may itself say Duplicate.
-                if (preg_match('/\A\[.*\] errno\((\d+)\) /s', $error, $match) === 1) {
-                    return $match[1] !== '1062';
-                }
-                // Retain the legacy keyword policy for diagnostics without a query errno.
-                return stripos($error, 'Duplicate') === false;
-            });
-            $complete = true;
-            if ($errors !== []) {
-                $output = print_r($errors, true);
-                $complete = file_put_contents(SQL_ERROR_FILE, $output, FILE_APPEND) === strlen($output);
-            }
-            // Keep the public list intact; only completed appends advance its logged snapshot.
-            if ($complete) {
-                $this->_logged_errors = $this->errors;
-            }
-        }
-        if ($this->_replay !== []) {
-            $this->flush_replay();
-        }
-        if (!SQL_ERROR_FILE || $complete) {
-            $this->_resource_close_pending = false;
-        }
         if ($streamFailure !== null) {
             throw $streamFailure;
         }
     }
 
-    /** Append one isolated session; recover a failed append while still holding the lock. */
-    private function flush_replay(): void
-    {
-        $fp = @fopen($this->_replay_file, 'c+b');
-        if ($fp === false) {
-            throw new RuntimeException('Unable to open replay log: ' . $this->_replay_file);
-        }
-        $locked = false;
-        try {
-            $locked = flock($fp, LOCK_EX);
-            if (!$locked) {
-                throw new RuntimeException('Unable to lock replay log: ' . $this->_replay_file);
-            }
-            if (fseek($fp, 0, SEEK_END) !== 0 || ($checkpoint = ftell($fp)) === false) {
-                throw new RuntimeException('Replay log must support seek and truncate');
-            }
-            // Put delimiters on their own lines so trailing SQL comments cannot swallow them.
-            $chunk = $this->_replay_header . implode("\n;\n", $this->_replay)
-                . "\n;\nROLLBACK;\nSET SESSION autocommit = 1;\n-- End ThreadFin replay session\n";
-            try {
-                if (stream_output_fn($chunk, $fp) < 0 || !fflush($fp)) {
-                    throw new RuntimeException('Unable to write replay log: ' . $this->_replay_file);
-                }
-            } catch (\Throwable $error) {
-                // No concurrent writer can observe/reuse our checkpoint until recovery finishes.
-                if (!@ftruncate($fp, $checkpoint) || !@fflush($fp)) {
-                    throw new RuntimeException('Replay recovery failed; repair journal before retrying', 0, $error);
-                }
-                throw $error;
-            }
-            $this->_replay = [];
-        } finally {
-            if ($locked) {
-                flock($fp, LOCK_UN);
-            }
-            fclose($fp);
-        }
-    }
 }
 
 
@@ -2096,195 +1682,4 @@ class SQL implements \ArrayAccess, \Iterator, \SeekableIterator, \Countable
             $this->_position = 0;
         }
     }
-}
-
-
-/**
- * database backup checkpoint offset
- * @package ThreadFinDB
- */
-class Offset
-{
-    public $table;
-    public $limit_sz = 0;
-    public $offset = 0;
-    const TABLE_COMPLETE = -1;
-
-    public function __construct(string $table, int $limit_sz = 300)
-    {
-        $this->limit_sz = $limit_sz;
-        $this->table = $table;
-    }
-
-    /**
-     * update a table saved offset
-     * @param string $table 
-     * @param int $offset 
-     * @param int $limit 
-     * @return void 
-     */
-    public function set_check_point(int $offset)
-    {
-        $this->offset = $offset;
-    }
-
-    /**
-     * @param string $table 
-     * @return bool true if the table is completely dumped, false if not or incomplete
-     */
-    public function is_table_complete(): bool
-    {
-        return $this->offset == Offset::TABLE_COMPLETE;
-    }
-}
-
-/**
- * function suitable for database dumping to gz compressed output file
- * this is equal to calling stream_output_fn($data, $stream, "gzwrite")
- * @param string $data 
- * @param mixed $stream 
- * @return int -1 on error, else total byte length written to stream across all writes
- */
-function gz_output_fn(?string $data, $stream): int
-{
-    return stream_output_fn($data, $stream, "gzwrite");
-}
-
-/**
- * Write a complete dump chunk, retrying positive short writes.
- * @param ?string $data null/empty chunks query the current total without writing
- * @param mixed $stream an open stream resource
- * @param callable $fn writer returning an integer byte count or false
- * @return int -1 on failed/invalid progress, else cumulative bytes for this handle
- *             (successful prefixes remain counted if a later write fails)
- */
-function stream_output_fn(?string $data, $stream, $fn = "fwrite"): int
-{
-    assert(is_resource($stream), "stream must be a resource");
-    // Resource IDs separate handles without retaining resources and preventing closure.
-    static $total_bytes = [];
-    $id = get_resource_id($stream);
-    $total_bytes[$id] ??= 0;
-    $length = strlen($data ?? '');
-    $offset = 0;
-    while ($offset < $length) {
-        $bytes = $fn($stream, substr($data, $offset));
-        if (!is_int($bytes) || $bytes <= 0 || $bytes > $length - $offset) {
-            return -1;
-        }
-        $offset += $bytes;
-        $total_bytes[$id] += $bytes;
-    }
-    return $total_bytes[$id];
-}
-
-
-/** Opt-in frozen-source file/checkpoint export. See db_dump.php for v1 restrictions. */
-function dump_resumable(DB $db, string $output_path, string $checkpoint_path, array $options = []): DumpReport
-{
-    return $db->dump_resumable($output_path, $checkpoint_path, $options);
-}
-
-/**
- * dump a single SQL table 300 rows at a time
- * @param DB $db
- * @param callable $write_fn writer returning a negative value on failure
- * @param array $row SHOW TABLES row
- * @return Offset checkpoint after the last fully written row batch
- */
-function dump_table(DB $db, callable $write_fn, array $row): ?Offset
-{
-    $idx = 0;
-    $limit = 300;
-    $db_name = $db->database;
-    $table = $row["Tables_in_$db_name"];
-    $offset = new Offset($table);
-
-    // find number of rows
-    $num_rows = intval($db->fetch("SELECT count(*) as count FROM $table")->col("count")());
-    // the create statement
-    $create = $db->fetch("SHOW CREATE TABLE $table");
-    // Stop immediately if a header/DDL chunk cannot be written.
-    if (
-        $write_fn("# Export of $table\n# $num_rows rows in $table\n") < 0
-        || $write_fn("DROP TABLE IF EXISTS `$table`;\n") < 0
-        || $write_fn($create->col("Create Table")() . ";\n\n") < 0
-    ) {
-        return $offset;
-    }
-
-    // insert $limit rows at a time
-    while ($idx < $num_rows) {
-        $limit = min($limit, $num_rows - $idx);
-        $rows = $db->fetch("SELECT * FROM $table LIMIT $limit OFFSET $idx", NULL, MYSQLI_NUM);
-        // create the output string
-        $result = $rows->reduce(function (string $carry, array $row) {
-            return $carry . "(" . implode(",", array_map('\ThreadFin\DB\quote', $row)) . "),\n";
-        }, "INSERT IGNORE INTO $table VALUES");
-        // write to the output stream
-        $bytes_written = $write_fn(substr($result, 0, -2) . ";\n\n");
-        if ($bytes_written < 0) {
-            return $offset;
-        }
-
-        // increment the offset by the limit
-        $idx += $limit;
-        $offset->set_check_point($idx);
-
-        // let the database rest a second
-        usleep(100000);
-    }
-    $offset->set_check_point(Offset::TABLE_COMPLETE);
-
-    return $offset;
-}
-
-/**
- * dump all database tables to the function $write_fn
- * @param Credentials $cred Access credentials to the database
- * @param string $db_name the name of the database (eg, wordpress)
- * @param callable $write_fn a function that takes a string and 
- *      writes it to the output stream (fwrite, gzwrite, etc)
- * @param int $max_bytes maximum uncompressed bytes, including headers (nonnegative)
- * @return array of Offset objects. one for each table in $db_name
- */
-function dump_database(Credentials $cred, string $db_name, callable $write_fn, int $max_bytes = 1024 * 1024 * 50): array
-{
-    if ($max_bytes < 0) {
-        throw new \InvalidArgumentException('dump byte budget must be nonnegative');
-    }
-    $header = "# Database export of ($db_name) began at UTC: "
-        . date(DATE_RFC3339) . "\n# UTC tv: " . utc_time() . "\n\n";
-    // Restore the same charset/mode required by PHP-side quoted dump values.
-    $init_sql = "SET NAMES 'utf8mb4';\n" . DB_SQL_MODE_SETUP . ";\n";
-
-    // Select the requested database without mutating the supplied credentials.
-    $db = DB::connect($cred->host, $cred->username, $cred->password, $db_name);
-    $tables = $db->fetch("SHOW TABLES");
-    $remaining = $max_bytes;
-    $stopped = false;
-    $bounded_write = function (string $chunk) use ($write_fn, &$remaining, &$stopped): int {
-        $bytes = strlen($chunk);
-        // Keep chunks whole so a budget stop cannot emit truncated SQL.
-        if ($stopped || $bytes > $remaining) {
-            $stopped = true;
-            return -1;
-        }
-        if ($write_fn($chunk) < 0) {
-            $stopped = true;
-            return -1;
-        }
-        // Writers may return cumulative totals; account for input bytes instead.
-        $remaining -= $bytes;
-        return $bytes;
-    };
-    $bounded_write($header . $init_sql);
-
-    return $tables->map(function (array $row) use ($db, $bounded_write, &$remaining, &$stopped): Offset {
-        if ($stopped || $remaining === 0) {
-            // Preserve an incomplete checkpoint for every unvisited table.
-            return new Offset($row["Tables_in_{$db->database}"]);
-        }
-        return dump_table($db, $bounded_write, $row);
-    });
 }

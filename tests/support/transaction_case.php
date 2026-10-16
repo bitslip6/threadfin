@@ -5,8 +5,8 @@ $GLOBALS['db_fixture_legacy_sql_exception'] = in_array($argv[1] ?? '',
     ['exception_without_sqlstate_write', 'exception_without_sqlstate_read'], true);
 require __DIR__ . '/mysqli.php';
 require __DIR__ . '/../../core.php';
-require __DIR__ . '/../../db.php';
-use ThreadFin\DB\DB;
+require __DIR__ . '/../../db-extended.php';
+use ThreadFin\DB\DBExtended as DB;
 use ThreadFin\DB\ExecutionFailure;
 use const ThreadFin\DB\DB_FETCH_INSERT_ID;
 use const ThreadFin\DB\DB_FETCH_NUM_ROWS;

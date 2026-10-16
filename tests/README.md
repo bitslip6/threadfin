@@ -1,10 +1,16 @@
-# db.php regression tests
+# Database regression tests
+
+Import `db.php` for the standalone basic `ThreadFin\DB\DB` API. Import
+`db-extended.php` and use `ThreadFin\DB\DBExtended` for simulation, logging,
+replay, telemetry, and exports. Operational test fixtures use `DBExtended`;
+`test_db_imports.php` verifies both entry points in isolated processes.
 
 These are expected-behavior TinyTest tests, not tests that expect the current bugs.
 The initial baseline was **41 failed / 0 passed / 0 incomplete / 0 skipped**.
 The SQL-injection work expanded it to **44 failed / 0 passed** before the fix.
-The current suite has **348 tests: 348 passed / 0 failed**, exit 0, with no
-incomplete cases, skips, or runner errors. Quoting, connection failure handling,
+The import split is covered by `test_db_imports.php`. The default local suite
+currently has **353 tests: 352 passed / 1 failed**; the remaining independent
+`test_db_verify_backtick_escape` failure is in standalone `db_verify.php`. Quoting, connection failure handling,
 the dump charset-statement terminator, current-row column lookup, complete
 buffered-result array conversion, associative duplicate updates, object
 store/attribute mapping, cursor synchronization, invalid array-read rejection,
@@ -19,7 +25,7 @@ replay initialization also pass. All reviewed regressions are fixed.
 
 ## Current status
 
-Verified with the default TinyTest runner: **348 total, 348 passed, 0 failed**.
+Verified with the default TinyTest runner: **353 total, 352 passed, 1 failed** (`test_db_verify_backtick_escape`).
 The additive feature APIs and restrictions are documented in [db-features.md](../docs/db-features.md).
 There are **0 incomplete tests, 0 skipped tests, and 0 runner errors**, exit code 0.
 Counts below are test functions, not assertions or separate bugs.

@@ -1,6 +1,6 @@
 <?php declare(strict_types=1);
 use ThreadFin\DB\SQL;
-use ThreadFin\DB\DB;
+use ThreadFin\DB\DBExtended as DB;
 
 function db_hardening_case(string $case): mixed {
     switch ($case) {

@@ -14,9 +14,9 @@ function db_fixture_file(): string {
 }
 define('SQL_ERROR_FILE', ($argv[1] ?? '') === 'error_log_disabled' ? false : db_fixture_file());
 require __DIR__ . '/../../core.php';
-require __DIR__ . '/../../db.php';
+require __DIR__ . '/../../db-extended.php';
 
-use ThreadFin\DB\DB;
+use ThreadFin\DB\DBExtended as DB;
 use ThreadFin\DB\SQL;
 use ThreadFin\DB\Credentials;
 use function ThreadFin\DB\quote;

@@ -27,8 +27,8 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 define('SQL_ERROR_FILE', false);
 require __DIR__.'/mysqli.php';
 require __DIR__.'/../../core.php';
-require __DIR__.'/../../db.php';
-use ThreadFin\DB\DB;
+require __DIR__.'/../../db-extended.php';
+use ThreadFin\DB\DBExtended as DB;
 use ThreadFin\DB\SQL;
 use function ThreadFin\DB\dump_resumable;
 class DumpFixtureDB extends DB {

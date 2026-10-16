@@ -15,8 +15,8 @@ namespace {
 error_reporting(E_ALL & ~E_DEPRECATED);
 define('SQL_ERROR_FILE',false);
 require __DIR__.'/../../core.php';
-require __DIR__.'/../../db.php';
-use ThreadFin\DB\DB;
+require __DIR__.'/../../db-extended.php';
+use ThreadFin\DB\DBExtended as DB;
 use function ThreadFin\DB\dump_resumable;
 function dump_native_handle(?string $user=null): mysqli {
     return new mysqli('localhost',$user ?? (getenv('THREADFIN_TEST_MYSQL_USER') ?: 'root'),'',''.getenv('THREADFIN_TEST_MYSQL_DATABASE'),null,getenv('THREADFIN_TEST_MYSQL_SOCKET'));
